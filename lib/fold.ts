@@ -1,5 +1,5 @@
 /**
- * pi-smart-fold — pure folding helpers.
+ * pi-smart-fold — pure folding / formatting helpers.
  *
  * No pi imports here: this module stays dependency-free and unit-testable
  * with plain `node` (Node >= 23 type stripping; no build step needed).
@@ -25,6 +25,10 @@ export function codePointWidth(cp: number): number {
     (cp >= 0xfe00 && cp <= 0xfe0f)
   ) {
     return 0;
+  }
+  // Wide: keycap-base misc-technical emoji (⏱ ⏳ ⏰ …) with emoji presentation
+  if (cp >= 0x23e9 && cp <= 0x23f3) {
+    return 2;
   }
   // Wide: Hangul Jamo, CJK radicals/symbols, kana, Yi, Hangul syllables,
   // CJK ideographs (incl. ext A/B+), compat ideographs/forms, fullwidth forms,
@@ -85,6 +89,13 @@ export function tailFit(input: string, maxWidth: number): string {
   return "…" + chars.slice(start).join("");
 }
 
+/** Clamp a renderer-provided width to something sane for one-line folding. */
+export function sanitizeWidth(availableWidth: number, fallback = 80): number {
+  return Number.isFinite(availableWidth) && availableWidth >= 8
+    ? Math.floor(availableWidth)
+    : fallback;
+}
+
 /** Last line of a markdown string whose trimmed content is non-empty. */
 export function lastNonEmptyLine(markdown: string): string {
   const lines = markdown.split(/\r?\n/);
@@ -124,10 +135,188 @@ export function stripBlockMarkers(raw: string): string {
 export function collapseThinking(markdown: string, availableWidth: number): string {
   const line = stripBlockMarkers(lastNonEmptyLine(markdown));
   if (!line) return markdown;
-  // Sanitize the width: renderers should always pass a positive number, but a
-  // missing/NaN value must degrade to a sane default instead of leaking NaN.
-  const width = Number.isFinite(availableWidth) && availableWidth >= 8
-    ? Math.floor(availableWidth)
-    : 80;
-  return tailFit(line, width);
+  return tailFit(line, sanitizeWidth(availableWidth));
+}
+
+// ---------------------------------------------------------------------------
+// Durations
+// ---------------------------------------------------------------------------
+
+const pad2 = (n: number): string => String(n).padStart(2, "0");
+
+/**
+ * Human-readable duration.
+ * - "live": whole seconds, for the ticking badge while the model thinks.
+ * - "final": one decimal below a minute, then `XmYYs` / `XhYYm`.
+ */
+export function formatDuration(ms: number, style: "live" | "final" = "final"): string {
+  if (!Number.isFinite(ms) || ms < 0) ms = 0;
+  const totalSeconds = Math.floor(ms / 1000);
+  if (style === "live") {
+    if (totalSeconds < 60) return `${totalSeconds}s`;
+    if (totalSeconds < 3600) return `${Math.floor(totalSeconds / 60)}m${pad2(totalSeconds % 60)}s`;
+    return `${Math.floor(totalSeconds / 3600)}h${pad2(Math.floor((totalSeconds % 3600) / 60))}m`;
+  }
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  if (totalSeconds < 3600) return `${Math.floor(totalSeconds / 60)}m${pad2(totalSeconds % 60)}s`;
+  return `${Math.floor(totalSeconds / 3600)}h${pad2(Math.floor((totalSeconds % 3600) / 60))}m`;
+}
+
+// ---------------------------------------------------------------------------
+// Content hashing (stable identity for a thinking block across renders)
+// ---------------------------------------------------------------------------
+
+/** 32-bit FNV-1a of a string (UTF-16 code units). */
+function fnv1a(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Cheap, stable content hash: `<length>:<fnv1a-hex>`.
+ * Used to match a rendered thinking block back to its recorded duration.
+ */
+export function hashText(text: string): string {
+  return `${text.length.toString(36)}:${fnv1a(text).toString(16)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Line diff (for the write tool's `+N -M` stat)
+// ---------------------------------------------------------------------------
+
+export interface LineDiffStat {
+  added: number;
+  removed: number;
+}
+
+function splitLines(text: string): string[] {
+  return text.replace(/\n$/, "").split("\n");
+}
+
+/**
+ * Line-level added/removed counts between two file contents, git-diff style.
+ *
+ * Common prefix/suffix lines are trimmed first (cheap), then the middle is
+ * measured with an LCS table. When the middle is too large for the LCS
+ * budget (`maxCells`), it is treated as a full replacement.
+ * `oldText === undefined` means the file did not exist yet (everything added).
+ */
+export function countLineDiff(
+  oldText: string | undefined,
+  newText: string,
+  maxCells = 1_500_000,
+): LineDiffStat {
+  const next = splitLines(newText);
+  if (oldText === undefined) return { added: next.length, removed: 0 };
+  const prev = splitLines(oldText);
+  if (prev.join("\n") === next.join("\n")) return { added: 0, removed: 0 };
+
+  // Trim common prefix/suffix (without letting them overlap).
+  let prefix = 0;
+  while (prefix < prev.length && prefix < next.length && prev[prefix] === next[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < prev.length - prefix &&
+    suffix < next.length - prefix &&
+    prev[prev.length - 1 - suffix] === next[next.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  const a = prev.slice(prefix, prev.length - suffix);
+  const b = next.slice(prefix, next.length - suffix);
+  if (a.length === 0) return { added: b.length, removed: 0 };
+  if (b.length === 0) return { added: 0, removed: a.length };
+  if (a.length * b.length > maxCells) return { added: b.length, removed: a.length };
+
+  // LCS length over the middle sections (classic DP, row-major Uint32 table).
+  const n = a.length;
+  const m = b.length;
+  const stride = m + 1;
+  const dp = new Uint32Array((n + 1) * stride);
+  for (let i = n - 1; i >= 0; i--) {
+    const row = i * stride;
+    const nextRow = (i + 1) * stride;
+    for (let j = m - 1; j >= 0; j--) {
+      dp[row + j] =
+        a[i] === b[j]
+          ? dp[nextRow + j + 1] + 1
+          : Math.max(dp[nextRow + j], dp[row + j + 1]);
+    }
+  }
+  const common = dp[0];
+  return { added: b.length - common, removed: a.length - common };
+}
+
+// ---------------------------------------------------------------------------
+// Thinking line renderers (display-only, used by the markdown transformer)
+// ---------------------------------------------------------------------------
+
+/**
+ * The live two-line view shown while the model is thinking:
+ * ```
+ * Thinking… (8s)      ← bold label line
+ * <scrolling tail>     ← newest thinking text, tail-truncated
+ * ```
+ * Without a known elapsed time only the tail line is shown.
+ */
+export function liveThinkingLine(
+  markdown: string,
+  elapsedMs: number | undefined,
+  width: number,
+): string {
+  const tail = stripBlockMarkers(lastNonEmptyLine(markdown));
+  if (!tail) return markdown;
+  const fitted = tailFit(tail, sanitizeWidth(width));
+  if (elapsedMs === undefined) return fitted;
+  return `**Thinking… (${formatDuration(elapsedMs, "live")})**\n\n${fitted}`;
+}
+
+/**
+ * The single collapsed line shown once a thinking run has finished.
+ * - "smart": `Thought for 12.4s` (bold) — pi's native hidden-label look plus time.
+ * - "tail":  bold duration prefix + the last line (legacy one-line tail fold).
+ */
+export function foldedThinkingLine(
+  markdown: string,
+  ms: number | undefined,
+  width: number,
+  style: "smart" | "tail",
+): string {
+  const w = sanitizeWidth(width);
+  if (style === "tail") {
+    const tail = stripBlockMarkers(lastNonEmptyLine(markdown));
+    if (!tail) return markdown;
+    const prefix = ms === undefined ? "" : `**${formatDuration(ms, "final")}** · `;
+    return tailFit(prefix + tail, w);
+  }
+  return tailFit(
+    ms === undefined ? "**Thought…**" : `**Thought for ${formatDuration(ms, "final")}**`,
+    w,
+  );
+}
+
+/**
+ * Bold duration footer appended below fully-expanded thinking text
+ * (`\n\n**Thought for 12.4s**`), or an empty string when unknown.
+ */
+export function expandedThinkingSuffix(ms: number | undefined): string {
+  return ms === undefined ? "" : `\n\n**Thought for ${formatDuration(ms, "final")}**`;
+}
+
+// ---------------------------------------------------------------------------
+// Mouse click detection (SGR + X10 encodings, button press only)
+// ---------------------------------------------------------------------------
+
+/** SGR press: `ESC [ < button ; col ; row M` — buttons 0/1/2, no motion flag. */
+const SGR_CLICK_PATTERN = /\u001b\[<(?:0|1|2);\d+;\d+M/;
+/** X10 press: `ESC [ M` + Cb byte 0x20–0x22 (left/middle/right press). */
+const X10_CLICK_PATTERN = /\u001b\[M[\u0020-\u0022]/;
+
+/** True when a raw terminal input chunk contains a physical mouse click. */
+export function hasMouseClick(data: string): boolean {
+  return SGR_CLICK_PATTERN.test(data) || X10_CLICK_PATTERN.test(data);
 }

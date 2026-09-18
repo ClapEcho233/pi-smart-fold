@@ -14,8 +14,16 @@ import {
   lastNonEmptyLine,
   stripBlockMarkers,
   collapseThinking,
+  formatDuration,
+  hashText,
+  countLineDiff,
+  liveThinkingLine,
+  foldedThinkingLine,
+  expandedThinkingSuffix,
+  hasMouseClick,
 } from "../lib/fold.ts";
 import { defaultConfig, loadConfig, saveConfig } from "../lib/config.ts";
+import { ThinkingTracker, trailingThinkingText } from "../lib/thinking.ts";
 
 let passed = 0;
 const check = (name, fn) => {
@@ -39,6 +47,10 @@ check("codePointWidth: CJK is 2", () => {
 });
 check("codePointWidth: emoji is 2", () => {
   assert.equal(codePointWidth("😀".codePointAt(0)), 2);
+});
+check("codePointWidth: stopwatch emoji is 2", () => {
+  assert.equal(codePointWidth("⏱".codePointAt(0)), 2);
+  assert.equal(displayWidth("⏱ 8s"), 5); // 2 + 1 + 2
 });
 check("codePointWidth: combining mark is 0", () => {
   assert.equal(codePointWidth(0x0301), 0);
@@ -141,7 +153,119 @@ check("collapseThinking: non-finite width degrades to default 80", () => {
   assert.equal(collapseThinking("a\nb", undefined), "b");
 });
 
-// -------------------------------------------------------------- config ----
+// --------------------------------------------------------- formatDuration ----
+check("formatDuration: live style uses whole seconds", () => {
+  assert.equal(formatDuration(0, "live"), "0s");
+  assert.equal(formatDuration(8_400, "live"), "8s");
+  assert.equal(formatDuration(91_000, "live"), "1m31s");
+  assert.equal(formatDuration(3_723_000, "live"), "1h02m");
+});
+check("formatDuration: final style uses one decimal under a minute", () => {
+  assert.equal(formatDuration(12_350), "12.3s"); // toFixed(1) rounds
+  assert.equal(formatDuration(940), "0.9s");
+  assert.equal(formatDuration(59_999), "60.0s"); // just under the boundary
+});
+check("formatDuration: final style switches to m/h", () => {
+  assert.equal(formatDuration(61_500), "1m01s");
+  assert.equal(formatDuration(3_723_000), "1h02m");
+});
+check("formatDuration: tolerates garbage", () => {
+  assert.equal(formatDuration(Number.NaN), "0.0s");
+  assert.equal(formatDuration(-5, "live"), "0s");
+});
+
+// -------------------------------------------------------------- hashText ----
+check("hashText: deterministic and distinguishing", () => {
+  assert.equal(hashText("hello"), hashText("hello"));
+  assert.notEqual(hashText("hello"), hashText("hello!"));
+  assert.notEqual(hashText("ab"), hashText("ba")); // same length, different hash
+});
+check("hashText: encodes length", () => {
+  assert.equal(hashText(""), "0:811c9dc5"); // FNV offset basis, length 0
+});
+
+// ---------------------------------------------------------- countLineDiff ----
+check("countLineDiff: new file → all added", () => {
+  assert.deepEqual(countLineDiff(undefined, "a\nb\nc"), { added: 3, removed: 0 });
+});
+check("countLineDiff: identical → zeros (trailing newline tolerant)", () => {
+  assert.deepEqual(countLineDiff("a\nb\n", "a\nb\n"), { added: 0, removed: 0 });
+  assert.deepEqual(countLineDiff("a\nb", "a\nb\n"), { added: 0, removed: 0 });
+});
+check("countLineDiff: pure append", () => {
+  assert.deepEqual(countLineDiff("a\nb", "a\nb\nc\nd"), { added: 2, removed: 0 });
+});
+check("countLineDiff: pure removal", () => {
+  assert.deepEqual(countLineDiff("a\nb\nc", "a"), { added: 0, removed: 2 });
+});
+check("countLineDiff: modify one middle line", () => {
+  assert.deepEqual(countLineDiff("a\nb\nc", "a\nX\nc"), { added: 1, removed: 1 });
+});
+check("countLineDiff: full rewrite", () => {
+  assert.deepEqual(countLineDiff("a\nb\nc", "x\ny\nz"), { added: 3, removed: 3 });
+});
+check("countLineDiff: LCS detects moved/matching middle lines", () => {
+  // "b" is kept as a common subsequence
+  assert.deepEqual(countLineDiff("a\nb\nc", "x\nb\nz"), { added: 2, removed: 2 });
+});
+check("countLineDiff: oversized middle falls back to replacement", () => {
+  const a = Array.from({ length: 100 }, (_, i) => `old-${i}`);
+  const b = Array.from({ length: 100 }, (_, i) => `new-${i}`);
+  // maxCells=1 forces the fallback path instead of LCS
+  assert.deepEqual(countLineDiff(a.join("\n"), b.join("\n"), 1), {
+    added: 100,
+    removed: 100,
+  });
+});
+check("countLineDiff: prefix/suffix trim keeps LCS small", () => {
+  const head = Array.from({ length: 500 }, (_, i) => `h${i}`);
+  const tail = Array.from({ length: 500 }, (_, i) => `t${i}`);
+  const oldText = [...head, "MID", ...tail].join("\n");
+  const newText = [...head, "NEW", ...tail].join("\n");
+  assert.deepEqual(countLineDiff(oldText, newText), { added: 1, removed: 1 });
+});
+
+// -------------------------------------------------- thinking line renderers ----
+check("liveThinkingLine: bold label line above the tail", () => {
+  assert.equal(
+    liveThinkingLine("first\nlast line", 8_000, 80),
+    "**Thinking… (8s)**\n\nlast line",
+  );
+});
+check("liveThinkingLine: unknown duration → bare tail", () => {
+  assert.equal(liveThinkingLine("first\nlast line", undefined, 80), "last line");
+});
+check("liveThinkingLine: truncates tail to width", () => {
+  const out = liveThinkingLine("short\n" + "x".repeat(100), 5_000, 20);
+  const [label, , tail] = out.split("\n");
+  assert.equal(label, "**Thinking… (5s)**");
+  assert.equal(displayWidth(tail) <= 20, true);
+  assert.equal(tail.startsWith("…"), true);
+});
+check("liveThinkingLine: empty content passes through", () => {
+  assert.equal(liveThinkingLine("\n \n", 1_000, 80), "\n \n");
+});
+check("foldedThinkingLine: smart shows bold Thought-for line", () => {
+  assert.equal(
+    foldedThinkingLine("anything at all", 12_340, 80, "smart"),
+    "**Thought for 12.3s**",
+  );
+});
+check("foldedThinkingLine: smart without duration", () => {
+  assert.equal(foldedThinkingLine("anything", undefined, 80, "smart"), "**Thought…**");
+});
+check("foldedThinkingLine: tail keeps the tail + bold duration", () => {
+  assert.equal(
+    foldedThinkingLine("first\nlast line", 12_340, 80, "tail"),
+    "**12.3s** · last line",
+  );
+});
+check("expandedThinkingSuffix: bold footer or empty", () => {
+  assert.equal(expandedThinkingSuffix(61_500), "\n\n**Thought for 1m01s**");
+  assert.equal(expandedThinkingSuffix(undefined), "");
+});
+
+// ------------------------------------------------------------ config ----
 check("config: defaults when file missing", () => {
   const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
   try {
@@ -150,14 +274,45 @@ check("config: defaults when file missing", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
-check("config: save/load roundtrip and partial merge", () => {
+check("config: save/load roundtrip with new fields", () => {
   const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
   try {
-    assert.equal(saveConfig(dir, { toolsFold: false, thinkingFold: true }), true);
-    assert.deepEqual(loadConfig(dir), { toolsFold: false, thinkingFold: true });
-    // partial file merges over defaults
+    const next = {
+      toolsFold: false,
+      thinking: "tail",
+      writeStat: false,
+      writeCollapsed: "preview",
+    };
+    assert.equal(saveConfig(dir, next), true);
+    assert.deepEqual(loadConfig(dir), next);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+check("config: migrates legacy thinkingFold boolean", () => {
+  const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
+  try {
     writeFileSync(join(dir, "smart-fold.config.json"), '{"thinkingFold": false}', "utf8");
-    assert.deepEqual(loadConfig(dir), { toolsFold: true, thinkingFold: false });
+    assert.deepEqual(loadConfig(dir).thinking, "off");
+    writeFileSync(join(dir, "smart-fold.config.json"), '{"thinkingFold": true}', "utf8");
+    assert.deepEqual(loadConfig(dir).thinking, "smart");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+check("config: invalid values fall back to defaults", () => {
+  const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
+  try {
+    writeFileSync(
+      join(dir, "smart-fold.config.json"),
+      '{"thinking": "bogus", "writeCollapsed": 42, "writeStat": "yes", "toolsFold": 1}',
+      "utf8",
+    );
+    const loaded = loadConfig(dir);
+    assert.deepEqual(loaded.thinking, "smart");
+    assert.deepEqual(loaded.writeCollapsed, "header");
+    assert.deepEqual(loaded.writeStat, true);
+    assert.deepEqual(loaded.toolsFold, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -170,6 +325,184 @@ check("config: broken JSON falls back to defaults", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ------------------------------------------------------ mouse detection ----
+check("hasMouseClick: SGR press sequences count as clicks", () => {
+  assert.equal(hasMouseClick("\u001b[<0;33;12M"), true); // left press
+  assert.equal(hasMouseClick("\u001b[<1;5;6M"), true); // middle press
+  assert.equal(hasMouseClick("\u001b[<2;9;40M"), true); // right press
+});
+check("hasMouseClick: releases, motion and wheel do not", () => {
+  assert.equal(hasMouseClick("\u001b[<0;33;12m"), false); // release
+  assert.equal(hasMouseClick("\u001b[<32;33;12M"), false); // motion
+  assert.equal(hasMouseClick("\u001b[<64;33;12M"), false); // wheel up
+  assert.equal(hasMouseClick("\u001b[<65;33;12M"), false); // wheel down
+});
+check("hasMouseClick: X10 press counts, plain keys do not", () => {
+  assert.equal(hasMouseClick("\u001b[M\u0020XY"), true); // Cb = 0x20 → button 1 press
+  assert.equal(hasMouseClick("\u001b[M\u0022XY"), true); // right press
+  assert.equal(hasMouseClick("\u001b[M\u0023XY"), false); // Cb = 0x23 (button 3 / wheel) → not a click
+  assert.equal(hasMouseClick("hello world"), false);
+  assert.equal(hasMouseClick("\u001b[A"), false); // arrow key
+});
+
+// ------------------------------------------------------ ThinkingTracker ----
+const msg = (content) => ({ content });
+
+check("ThinkingTracker: single run lifecycle", () => {
+  let t = 1_000;
+  const tracker = new ThinkingTracker(() => t);
+  tracker.handleUpdate({ type: "thinking_start", contentIndex: 0, partial: msg([]) });
+  t = 3_000;
+  tracker.handleUpdate({ type: "thinking_delta", contentIndex: 0, delta: "hmm ", partial: msg([{ type: "thinking", thinking: "hmm " }]) });
+  t = 5_200;
+  tracker.handleUpdate({
+    type: "thinking_end",
+    contentIndex: 0,
+    partial: msg([{ type: "thinking", thinking: "hmm let me think" }]),
+  });
+  // live elapsed while open
+  t = 6_000;
+  assert.equal(tracker.liveElapsedMs(), 5_000);
+  // text followed → closes the run
+  t = 7_000;
+  tracker.handleUpdate({
+    type: "text_start",
+    contentIndex: 1,
+    partial: msg([{ type: "thinking", thinking: "hmm let me think" }, { type: "text", text: "" }]),
+  });
+  assert.equal(tracker.liveElapsedMs(), undefined);
+  const hash = hashText("hmm let me think");
+  assert.equal(tracker.finalizedMs(hash), 4_200); // 5200 - 1000
+  const runs = tracker.drainPending();
+  assert.deepEqual(runs, [{ hash, ms: 4_200 }]);
+  assert.deepEqual(tracker.drainPending(), []);
+});
+
+check("ThinkingTracker: consecutive thinking blocks form one group", () => {
+  let t = 100;
+  const tracker = new ThinkingTracker(() => t);
+  tracker.handleUpdate({ type: "thinking_start", contentIndex: 0, partial: msg([]) });
+  t = 200;
+  tracker.handleUpdate({ type: "thinking_delta", contentIndex: 0, delta: "part one", partial: msg([{ type: "thinking", thinking: "part one" }]) });
+  t = 300;
+  tracker.handleUpdate({
+    type: "thinking_end",
+    contentIndex: 0,
+    partial: msg([{ type: "thinking", thinking: "part one" }]),
+  });
+  // second thinking block immediately after → same group, no close
+  tracker.handleUpdate({
+    type: "thinking_start",
+    contentIndex: 1,
+    partial: msg([{ type: "thinking", thinking: "part one" }]),
+  });
+  t = 400;
+  tracker.handleUpdate({
+    type: "thinking_end",
+    contentIndex: 1,
+    partial: msg([{ type: "thinking", thinking: "part one" }, { type: "thinking", thinking: "part two" }]),
+  });
+  const runs = tracker.handleMessageEnd(
+    msg([{ type: "thinking", thinking: "part one" }, { type: "thinking", thinking: "part two" }]),
+  );
+  assert.equal(runs.length, 1);
+  assert.deepEqual(runs[0], { hash: hashText("part one\n\npart two"), ms: 300 }); // 400 - 100
+});
+
+check("ThinkingTracker: tool call between thinking blocks splits groups", () => {
+  let t = 0;
+  const tracker = new ThinkingTracker(() => t);
+  t = 100;
+  tracker.handleUpdate({ type: "thinking_start", contentIndex: 0, partial: msg([]) });
+  t = 200;
+  tracker.handleUpdate({
+    type: "thinking_end",
+    contentIndex: 0,
+    partial: msg([{ type: "thinking", thinking: "before tool" }]),
+  });
+  t = 900;
+  tracker.handleUpdate({
+    type: "toolcall_start",
+    contentIndex: 1,
+    partial: msg([{ type: "thinking", thinking: "before tool" }, { type: "toolCall" }]),
+  });
+  // group 1's thinking ended at its last activity (t=200) → 100ms of thinking
+  assert.equal(tracker.finalizedMs(hashText("before tool")), 100);
+  // second group after the tool
+  tracker.handleUpdate({
+    type: "thinking_start",
+    contentIndex: 2,
+    partial: msg([{ type: "toolCall" }]),
+  });
+  t = 1_500;
+  const runs = tracker.handleMessageEnd(msg([{ type: "toolCall" }, { type: "thinking", thinking: "after tool" }]));
+  // both runs of the message are drained together
+  assert.equal(runs.length, 2);
+  assert.deepEqual(runs[0], { hash: hashText("before tool"), ms: 100 });
+  assert.deepEqual(runs[1], { hash: hashText("after tool"), ms: 600 }); // 1500 - 900
+  assert.equal(tracker.finalizedMs(hashText("after tool")), 600);
+});
+
+check("ThinkingTracker: finalizeIfMatches closes on exact text", () => {
+  let t = 10_000;
+  const tracker = new ThinkingTracker(() => t);
+  tracker.handleUpdate({ type: "thinking_start", contentIndex: 0, partial: msg([]) });
+  t = 12_500;
+  tracker.handleUpdate({
+    type: "thinking_end",
+    contentIndex: 0,
+    partial: msg([{ type: "thinking", thinking: "exact text" }]),
+  });
+  assert.equal(tracker.finalizeIfMatches("exact text"), 2_500);
+  assert.equal(tracker.liveElapsedMs(), undefined);
+  assert.equal(tracker.finalizeIfMatches("exact text"), undefined); // already closed
+  assert.equal(tracker.finalizedMs(hashText("exact text")), 2_500);
+});
+
+check("ThinkingTracker: restore merges persisted durations", () => {
+  const tracker = new ThinkingTracker(() => 0);
+  const hash = hashText("restored thought");
+  tracker.restore([{ hash, ms: 3_000 }]);
+  assert.equal(tracker.finalizedMs(hash), 3_000);
+  // invalid entries are ignored
+  tracker.restore([{ hash: 42, ms: "x" }, { hash: "ok", ms: 5 }]);
+  assert.equal(tracker.finalizedMs("ok"), 5);
+});
+
+check("ThinkingTracker: delta-only fallback when no thinking_end seen", () => {
+  let t = 0;
+  const tracker = new ThinkingTracker(() => t);
+  t = 100;
+  tracker.handleUpdate({ type: "thinking_start", contentIndex: 0, partial: msg([]) });
+  t = 250;
+  tracker.handleUpdate({ type: "thinking_delta", contentIndex: 0, delta: "partial", partial: msg([]) });
+  const runs = tracker.handleMessageEnd(undefined);
+  assert.equal(runs.length, 1);
+  assert.deepEqual(runs[0], { hash: hashText("partial"), ms: 150 });
+});
+
+// ------------------------------------------------------ trailingThinkingText ----
+check("trailingThinkingText: joins and trims trailing thinking blocks", () => {
+  assert.equal(
+    trailingThinkingText(
+      msg([{ type: "text", text: "hi" }, { type: "thinking", thinking: " one " }, { type: "thinking", thinking: "two" }]),
+    ),
+    "one\n\ntwo",
+  );
+});
+check("trailingThinkingText: stops at non-thinking block", () => {
+  assert.equal(
+    trailingThinkingText(msg([{ type: "thinking", thinking: "x" }, { type: "text", text: "hi" }])),
+    null,
+  );
+});
+check("trailingThinkingText: skips empty thinking blocks at the end", () => {
+  assert.equal(
+    trailingThinkingText(msg([{ type: "thinking", thinking: "x" }, { type: "thinking", thinking: "  " }])),
+    "x",
+  );
 });
 
 console.log(`✓ ${passed} test groups passed`);
