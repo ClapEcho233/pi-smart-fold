@@ -228,6 +228,10 @@ function installThinkingDisplayPatch(): void {
               }
               self.hiddenThinkingLabel = collapsedLabelText(runs, state);
             }
+          } else if (state.behavior === "seed") {
+            // While streaming, the label only shows after the user clicks the
+            // live tail hidden — point them at the second click.
+            self.hiddenThinkingLabel = "Thinking… · 再次点击展开";
           }
 
           const current = Array.from(overrides.entries());
@@ -240,7 +244,8 @@ function installThinkingDisplayPatch(): void {
             const changedRun = firstChangedRun(previous, current, seeded);
             if (changedRun !== null) {
               const runText = thinkingRunText(self.lastMessage ?? message, changedRun);
-              recordThinkingClick(runText);
+              const openNow = new Map(current).get(changedRun) === false;
+              recordThinkingClick(runText, openNow);
             }
           }
           self[OVERRIDE_SNAPSHOT] = current;
@@ -307,12 +312,33 @@ function collapsedLabelText(runs: string[], state: SmartFoldGlobalState): string
 
 const CLICK_AT = Symbol.for("pi-smart-fold.clickAt");
 const CLICK_HASH = Symbol.for("pi-smart-fold.clickHash");
-type ClickGlobal = typeof globalThis & { [CLICK_AT]?: number; [CLICK_HASH]?: string };
+const CLICK_OPEN_PREFIX = Symbol.for("pi-smart-fold.clickOpenPrefix");
+type ClickGlobal = typeof globalThis & {
+  [CLICK_AT]?: number;
+  [CLICK_HASH]?: string;
+  [CLICK_OPEN_PREFIX]?: string | null;
+};
 
-function recordThinkingClick(runText: string | null): void {
+/**
+ * Record a thinking click. `open` is the run's new visibility (false = the
+ * user clicked it open). For the still-streaming run we keep the clicked text
+ * as a prefix — thinking text only grows, so every later render of the same
+ * run starts with it and stays expanded until clicked closed.
+ */
+function recordThinkingClick(runText: string | null, open: boolean): void {
   const clickGlobal = globalThis as ClickGlobal;
   clickGlobal[CLICK_AT] = Date.now();
   if (runText !== null) clickGlobal[CLICK_HASH] = hashText(runText);
+  clickGlobal[CLICK_OPEN_PREFIX] = open && runText !== null ? runText : null;
+}
+
+/** Prefix of the streaming run the user clicked open, if any. */
+function openStreamingPrefix(): string | null {
+  return (globalThis as ClickGlobal)[CLICK_OPEN_PREFIX] ?? null;
+}
+
+function clearOpenStreamingPrefix(): void {
+  (globalThis as ClickGlobal)[CLICK_OPEN_PREFIX] = null;
 }
 
 /** How long after a click its re-render is expected (generous for slow frames). */
@@ -466,24 +492,14 @@ export default function smartFold(pi: ExtensionAPI): void {
     const width = context.availableWidth - 1; // renderer padding slack
     const key = hashText(markdown);
 
-    if (context.isStreaming) {
-      // Earlier thinking groups in the same (still streaming) message are
-      // already finished — show them in their folded, finalized form.
-      const done = tracker.finalizedMs(key);
-      if (done !== undefined) {
-        return foldedThinkingLine(markdown, done, width, "smart");
-      }
-      return liveThinkingLine(markdown, tracker.liveElapsedMs(), width);
-    }
-
     let ms = tracker.finalizedMs(key);
-    if (ms === undefined) ms = tracker.finalizeIfMatches(markdown);
+    if (ms === undefined && !context.isStreaming) ms = tracker.finalizeIfMatches(markdown);
 
-    // Finished thinking starts in pi's hidden state (the prototype patch
-    // seeds it), so an expanded render here means the user clicked this block
-    // open — the observer recorded exactly which block (by content hash).
-    // Mark it revealed (add-only): collapse happens by clicking back to the
-    // hidden label, which never runs this transformer.
+    // A click on this block re-renders it right after the click handler
+    // mutated that block's visibility override. The observer recorded exactly
+    // which block (by content hash) — mark it revealed (add-only). Collapse
+    // happens by clicking back to the hidden label, which never runs this
+    // transformer.
     const click = lastClickInfo();
     if (
       click &&
@@ -493,6 +509,26 @@ export default function smartFold(pi: ExtensionAPI): void {
     ) {
       revealedBlocks.add(key);
       if (revealedBlocks.size > MAX_REVEALED_BLOCKS) revealedBlocks.clear();
+    }
+
+    if (context.isStreaming) {
+      // Finished runs of the still-streaming message behave like finalized
+      // blocks: hidden label by default, full text when clicked open.
+      if (ms !== undefined) {
+        return revealedBlocks.has(key)
+          ? markdown.replace(/\s+$/, "") + expandedThinkingSuffix(ms)
+          : foldedThinkingLine(markdown, ms, width, "smart");
+      }
+      // The run that is still being written: live tail by default; full text
+      // so far when the user clicked it open (prefix identifies the run).
+      const openPrefix = openStreamingPrefix();
+      if (openPrefix !== null && markdown.startsWith(openPrefix)) {
+        const elapsed = tracker.liveElapsedMs();
+        const label =
+          elapsed === undefined ? "" : `**Thinking… (${formatDuration(elapsed, "live")})**\n\n`;
+        return label + markdown;
+      }
+      return liveThinkingLine(markdown, tracker.liveElapsedMs(), width);
     }
 
     if (mode === "full" || expandAllThinking || revealedBlocks.has(key)) {
@@ -517,6 +553,7 @@ export default function smartFold(pi: ExtensionAPI): void {
     const runs = tracker.handleMessageEnd(
       event.message as Parameters<typeof tracker.handleMessageEnd>[0],
     );
+    clearOpenStreamingPrefix(); // the streaming click no longer applies
     if (runs.length > 0) {
       try {
         pi.appendEntry("smart-fold-thinking", { runs });
@@ -527,23 +564,49 @@ export default function smartFold(pi: ExtensionAPI): void {
   });
 
   const restoreFromBranch = (ctx: CtxLike): void => {
+    writeStats.clear();
+    writeRows.clear();
     try {
       for (const entry of ctx.sessionManager.getBranch()) {
-        if (entry.type !== "custom" || entry.customType !== "smart-fold-thinking") continue;
-        const data = entry.data as { runs?: Array<{ hash?: unknown; ms?: unknown }> } | undefined;
-        if (!Array.isArray(data?.runs)) continue;
-        tracker.restore(
-          data.runs.filter(
-            (run): run is { hash: string; ms: number } =>
-              typeof run?.hash === "string" && typeof run?.ms === "number",
-          ),
-        );
+        if (entry.type === "custom" && entry.customType === "smart-fold-thinking") {
+          const data = entry.data as { runs?: Array<{ hash?: unknown; ms?: unknown }> } | undefined;
+          if (Array.isArray(data?.runs)) {
+            tracker.restore(
+              data.runs.filter(
+                (run): run is { hash: string; ms: number } =>
+                  typeof run?.hash === "string" && typeof run?.ms === "number",
+              ),
+            );
+          }
+          continue;
+        }
+        // Rebuild persisted write stats so history keeps showing +N -M.
+        if (entry.type === "message") {
+          const message = (
+            entry as {
+              message?: {
+                role?: string;
+                toolName?: string;
+                toolCallId?: string;
+                details?: { smartFold?: { added?: unknown; removed?: unknown } };
+              };
+            }
+          ).message;
+          if (
+            message?.role === "toolResult" &&
+            message.toolName === "write" &&
+            typeof message.toolCallId === "string"
+          ) {
+            const stat = message.details?.smartFold;
+            if (typeof stat?.added === "number" && typeof stat.removed === "number") {
+              writeStats.set(message.toolCallId, { added: stat.added, removed: stat.removed });
+            }
+          }
+        }
       }
     } catch {
       // Best-effort restore.
     }
-    writeStats.clear();
-    writeRows.clear();
   };
 
   // -------------------------------------------------------------------------
@@ -553,6 +616,7 @@ export default function smartFold(pi: ExtensionAPI): void {
     const scoped = ctx as unknown as CtxLike;
     restoreFromBranch(scoped);
     revealedBlocks.clear(); // sessions start compact
+    clearOpenStreamingPrefix();
     expandAllThinking = false;
     publishState();
     applyHiddenLabel(scoped);
@@ -782,6 +846,21 @@ export default function smartFold(pi: ExtensionAPI): void {
     } catch {
       // The row will pick the stat up on its next natural render.
     }
+  });
+
+  // Persist the write stat into the tool result's details so restored
+  // sessions keep showing `+N -M` in history (the pre-execution snapshot
+  // only exists live).
+  pi.on("tool_result", async (event) => {
+    if (event.toolName !== "write") return;
+    const stat = writeStats.get(event.toolCallId);
+    if (!stat) return;
+    if (event.isError) {
+      writeStats.delete(event.toolCallId); // nothing was changed
+      return;
+    }
+    const details = (event.details ?? {}) as Record<string, unknown>;
+    return { details: { ...details, smartFold: stat } };
   });
 
   // -------------------------------------------------------------------------
