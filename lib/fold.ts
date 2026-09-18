@@ -307,16 +307,3 @@ export function expandedThinkingSuffix(ms: number | undefined): string {
   return ms === undefined ? "" : `\n\n**Thought for ${formatDuration(ms, "final")}**`;
 }
 
-// ---------------------------------------------------------------------------
-// Mouse click detection (SGR + X10 encodings, button press only)
-// ---------------------------------------------------------------------------
-
-/** SGR press: `ESC [ < button ; col ; row M` — buttons 0/1/2, no motion flag. */
-const SGR_CLICK_PATTERN = /\u001b\[<(?:0|1|2);\d+;\d+M/;
-/** X10 press: `ESC [ M` + Cb byte 0x20–0x22 (left/middle/right press). */
-const X10_CLICK_PATTERN = /\u001b\[M[\u0020-\u0022]/;
-
-/** True when a raw terminal input chunk contains a physical mouse click. */
-export function hasMouseClick(data: string): boolean {
-  return SGR_CLICK_PATTERN.test(data) || X10_CLICK_PATTERN.test(data);
-}

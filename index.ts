@@ -51,7 +51,6 @@ import {
   displayWidth,
   expandedThinkingSuffix,
   foldedThinkingLine,
-  hasMouseClick,
   hashText,
   liveThinkingLine,
 } from "./lib/fold.ts";
@@ -64,6 +63,7 @@ import {
   type WriteCollapsedStyle,
 } from "./lib/config.ts";
 import { ThinkingTracker } from "./lib/thinking.ts";
+import { RevealController } from "./lib/reveal.ts";
 
 /** Best-effort resolve of this extension's directory (for the config file). */
 function resolveExtensionDir(): string | undefined {
@@ -113,7 +113,6 @@ interface CtxLike {
     notify(message: string, type?: "info" | "warning" | "error"): void;
     setToolsExpanded?(expanded: boolean): void;
     setHiddenThinkingLabel?(label?: string): void;
-    onTerminalInput?(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
     custom?: unknown;
     theme?: ThemeLike;
   };
@@ -124,7 +123,6 @@ interface CtxLike {
 }
 
 const MAX_WRITE_FILE_BYTES = 8 * 1024 * 1024;
-const MAX_REVEAL_ENTRIES = 2000;
 
 export default function smartFold(pi: ExtensionAPI): void {
   const extensionDir = resolveExtensionDir();
@@ -142,32 +140,32 @@ export default function smartFold(pi: ExtensionAPI): void {
   const tracker = new ThinkingTracker();
 
   /**
-   * Per-thinking-block state, used to detect "clicked to expand":
-   * pi renders a finalized thinking block expanded on its 1st render and
-   * again after every second click (the click in between rendered pi's
-   * native hidden label, which does NOT run this transformer). So:
-   *   - first render at a given width  → folded (count 0)
-   *   - a render shortly after a real mouse click → count++ → revealed
-   *   - any other re-render (theme change, layout, …) → count unchanged
-   * A width change means a re-layout, so state resets (blocks re-fold).
+   * Click-to-reveal state for finalized thinking blocks (see lib/reveal.ts):
+   * pi renders such a block expanded on its 1st render and again after every
+   * second click (the render in between shows pi's native hidden label and
+   * does NOT run this transformer). So the first render folds, later renders
+   * reveal — except when a burst of transforms looks like a global
+   * re-render (theme change, layout), which is rolled back.
    */
-  const reveal = new Map<string, { count: number; width: number }>();
+  const revealCtrl = new RevealController({
+    onInvalidation: () => {
+      // Rollback happened; force every message through the transformer again
+      // so accidentally-unfolded blocks heal back to their folded state.
+      try {
+        forceRerender();
+      } catch {
+        // Best-effort.
+      }
+    },
+  });
 
-  /** Timestamp of the last physical mouse click seen on the terminal. */
-  let lastClickAt = 0;
-  let inputHooked = false;
-  const CLICK_GRACE_MS = 700;
-
-  const hookMouseClicks = (ctx: CtxLike): void => {
-    if (inputHooked) return;
-    inputHooked = true; // also on failure — never retry within a session
+  /** Set in session_start; re-renders every assistant message. */
+  let forceRerenderFn: (() => void) | undefined;
+  const forceRerender = (): void => {
     try {
-      ctx.ui.onTerminalInput?.((data: string) => {
-        if (typeof data === "string" && hasMouseClick(data)) lastClickAt = Date.now();
-        return undefined;
-      });
+      forceRerenderFn?.();
     } catch {
-      // Mouse detection is best-effort; without it blocks simply stay folded.
+      // Best-effort.
     }
   };
 
@@ -177,22 +175,11 @@ export default function smartFold(pi: ExtensionAPI): void {
   /** Live write call rows, so a stat computed after render can force a rerender. */
   const writeRows = new Map<string, WriteCallWrapper>();
 
-  const shouldReveal = (key: string, width: number): boolean => {
-    let entry = reveal.get(key);
-    if (!entry || entry.width !== width) {
-      if (reveal.size > MAX_REVEAL_ENTRIES) reveal.clear();
-      entry = { count: 0, width };
-      reveal.set(key, entry);
-      return false; // first render at this width → folded
-    }
-    if (Date.now() - lastClickAt <= CLICK_GRACE_MS) entry.count += 1;
-    return entry.count >= 1;
-  };
-
   // -------------------------------------------------------------------------
   // 1) Thinking: live tail while streaming, folded line with duration after.
   // -------------------------------------------------------------------------
   pi.registerMarkdownTransformer((markdown, context) => {
+    revealCtrl.noteTransform(); // burst tracking for every message type
     if (context.messageType !== "assistant-thinking") return markdown;
     const mode = config.thinking;
     if (mode === "off") return markdown;
@@ -213,7 +200,7 @@ export default function smartFold(pi: ExtensionAPI): void {
     let ms = tracker.finalizedMs(key);
     if (ms === undefined) ms = tracker.finalizeIfMatches(markdown);
 
-    if (mode === "full" || shouldReveal(key, width)) {
+    if (mode === "full" || revealCtrl.shouldReveal(key, width)) {
       // Fully expanded: original text, with the duration footer at the bottom.
       return markdown.replace(/\s+$/, "") + expandedThinkingSuffix(ms);
     }
@@ -262,7 +249,7 @@ export default function smartFold(pi: ExtensionAPI): void {
     }
     writeStats.clear();
     writeRows.clear();
-    reveal.clear();
+    revealCtrl.clear();
   };
 
   // -------------------------------------------------------------------------
@@ -271,7 +258,11 @@ export default function smartFold(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const scoped = ctx as unknown as CtxLike;
     restoreFromBranch(scoped);
-    hookMouseClicks(scoped);
+    try {
+      forceRerenderFn = () => scoped.ui.setHiddenThinkingLabel?.();
+    } catch {
+      // Best-effort.
+    }
     if (!config.toolsFold) return;
     if (!ctx.hasUI) return; // no-op guard for print / json modes
     try {
@@ -405,7 +396,7 @@ export default function smartFold(pi: ExtensionAPI): void {
   const applyThinking = (mode: ThinkingMode, ctx: CtxLike): void => {
     config.thinking = mode;
     persist();
-    reveal.clear();
+    revealCtrl.clear();
     if (ctx.hasUI) {
       try {
         // Re-render every assistant message through the markdown transformer

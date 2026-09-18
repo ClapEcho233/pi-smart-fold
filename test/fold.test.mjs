@@ -17,13 +17,13 @@ import {
   formatDuration,
   hashText,
   countLineDiff,
-  liveThinkingLine,
-  foldedThinkingLine,
   expandedThinkingSuffix,
-  hasMouseClick,
+  foldedThinkingLine,
+  liveThinkingLine,
 } from "../lib/fold.ts";
 import { defaultConfig, loadConfig, saveConfig } from "../lib/config.ts";
 import { ThinkingTracker, trailingThinkingText } from "../lib/thinking.ts";
+import { RevealController } from "../lib/reveal.ts";
 
 let passed = 0;
 const check = (name, fn) => {
@@ -327,24 +327,84 @@ check("config: broken JSON falls back to defaults", () => {
   }
 });
 
-// ------------------------------------------------------ mouse detection ----
-check("hasMouseClick: SGR press sequences count as clicks", () => {
-  assert.equal(hasMouseClick("\u001b[<0;33;12M"), true); // left press
-  assert.equal(hasMouseClick("\u001b[<1;5;6M"), true); // middle press
-  assert.equal(hasMouseClick("\u001b[<2;9;40M"), true); // right press
+// ------------------------------------------------------ RevealController ----
+check("RevealController: first render folds, second reveals", () => {
+  let t = 1_000;
+  const ctrl = new RevealController({ now: () => t, schedule: (cb) => cb() });
+  assert.equal(ctrl.shouldReveal("k", 80), false); // finalize render
+  t = 2_000;
+  assert.equal(ctrl.shouldReveal("k", 80), true); // post-click render
+  assert.equal(ctrl.shouldReveal("k", 80), true); // stays revealed
 });
-check("hasMouseClick: releases, motion and wheel do not", () => {
-  assert.equal(hasMouseClick("\u001b[<0;33;12m"), false); // release
-  assert.equal(hasMouseClick("\u001b[<32;33;12M"), false); // motion
-  assert.equal(hasMouseClick("\u001b[<64;33;12M"), false); // wheel up
-  assert.equal(hasMouseClick("\u001b[<65;33;12M"), false); // wheel down
+check("RevealController: width change refolds", () => {
+  let t = 1_000;
+  const ctrl = new RevealController({ now: () => t, schedule: (cb) => cb() });
+  ctrl.shouldReveal("k", 80);
+  t = 2_000;
+  ctrl.shouldReveal("k", 80); // revealed
+  t = 3_000;
+  assert.equal(ctrl.shouldReveal("k", 100), false); // resize -> folded again
 });
-check("hasMouseClick: X10 press counts, plain keys do not", () => {
-  assert.equal(hasMouseClick("\u001b[M\u0020XY"), true); // Cb = 0x20 → button 1 press
-  assert.equal(hasMouseClick("\u001b[M\u0022XY"), true); // right press
-  assert.equal(hasMouseClick("\u001b[M\u0023XY"), false); // Cb = 0x23 (button 3 / wheel) → not a click
-  assert.equal(hasMouseClick("hello world"), false);
-  assert.equal(hasMouseClick("\u001b[A"), false); // arrow key
+check("RevealController: invalidation bursts roll back and heal", () => {
+  let t = 1_000;
+  let forced = 0;
+  const pending = [];
+  const flush = () => { const cbs = pending.splice(0); for (const cb of cbs) cb(); };
+  const ctrl = new RevealController({
+    now: () => t,
+    schedule: (cb) => pending.push(cb),
+    onInvalidation: () => { forced += 1; },
+    threshold: 3,
+  });
+  ctrl.noteTransform();
+  ctrl.noteTransform();
+  assert.equal(ctrl.shouldReveal("k", 80), false); // first render -> create only
+  ctrl.noteTransform();
+  ctrl.shouldReveal("k", 80); // increment inside the burst (would reveal)
+  ctrl.noteTransform();
+  ctrl.noteTransform();
+  flush(); // burst counted 5 > threshold 3 -> rollback + force + suppress
+  assert.equal(forced, 1);
+  t = 1_100; // inside the suppression window
+  assert.equal(ctrl.shouldReveal("k", 80), false); // healed back to folded, no increment
+  t = 5_000; // suppression over; a real post-click render reveals again
+  assert.equal(ctrl.shouldReveal("k", 80), true);
+});
+check("RevealController: click-sized bursts are not rolled back", () => {
+  let t = 1_000;
+  let forced = 0;
+  const ctrl = new RevealController({
+    now: () => t,
+    schedule: (cb) => cb(),
+    onInvalidation: () => { forced += 1; },
+    threshold: 8,
+  });
+  ctrl.noteTransform();
+  ctrl.noteTransform(); // click re-render: thinking + text of one message
+  assert.equal(ctrl.shouldReveal("k", 80), false);
+  t = 2_000;
+  ctrl.noteTransform();
+  assert.equal(ctrl.shouldReveal("k", 80), true); // revealed, no rollback
+  assert.equal(forced, 0);
+});
+check("RevealController: create-only bursts do not force a re-render", () => {
+  let forced = 0;
+  const ctrl = new RevealController({
+    schedule: (cb) => cb(),
+    onInvalidation: () => { forced += 1; },
+    threshold: 3,
+  });
+  for (let i = 0; i < 6; i++) ctrl.noteTransform(); // e.g. session restore
+  ctrl.shouldReveal("a", 80);
+  ctrl.shouldReveal("b", 80);
+  assert.equal(forced, 0); // no increments happened -> nothing to heal
+});
+check("RevealController: clear forgets everything", () => {
+  const ctrl = new RevealController({ schedule: (cb) => cb() });
+  ctrl.shouldReveal("k", 80);
+  ctrl.shouldReveal("k", 80);
+  ctrl.clear();
+  assert.equal(ctrl.shouldReveal("k", 80), false);
 });
 
 // ------------------------------------------------------ ThinkingTracker ----

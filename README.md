@@ -87,7 +87,8 @@ npm test   # 纯函数单元测试（Node ≥ 22.18 原生 TS 类型剥离，无
 
 ```
 index.ts           插件入口（transformer / 事件 / write 渲染包装 / /fold 设置界面）
-lib/fold.ts        纯函数：显示宽度、行尾截断、时长格式化、行级 diff、鼠标点击识别
+lib/fold.ts        纯函数：显示宽度、行尾截断、时长格式化、行级 diff
+lib/reveal.ts      点击展开状态机（区分点击与全局重渲染）
 lib/thinking.ts    思考计时状态机（按内容哈希记录各段思考时长）
 lib/config.ts      配置读写（含旧配置迁移；缺失/损坏时回退默认值）
 test/fold.test.mjs 单元测试
@@ -95,11 +96,11 @@ test/fold.test.mjs 单元测试
 
 ## 已知边界
 
-- thinking 的"点击展开"依赖 pi 原生的显示/隐藏切换：第一次点击折叠行会先显示 `Thinking...`（原生隐藏态），第二次点击才展开全文 —— 这是由 pi 的鼠标切换结构决定的（先折叠态 ↔ 展开态二选一）。
-- 终端窗口宽度变化会使思考块重新折叠（视为重新布局而非点击）。
+- thinking 的"点击展开"依赖 pi 原生的显示/隐藏切换：第一次点击折叠行会先显示 `Thinking...`（原生隐藏态），第二次点击才展开全文 —— 这是由 pi 的切换结构决定的（折叠态 ↔ 展开态二选一）。
+- 全局重渲染（如主题切换）通过"渲染突发批量检测"识别并自动回卷，不会误展开；极短会话（思考块少于阈值数量）中的主题切换可能误展开一次，调整窗口宽度即可恢复折叠。终端窗口宽度变化会使思考块重新折叠。
 - write 增删统计只对当前会话中的写入生效（恢复的旧会话没有执行前快照可对比）。
 - 与 pi 原生 "Hide thinking blocks"（`ctrl+t` 切换）叠加时，若隐藏了思考块，思考中不会显示滚动行 —— 建议保持默认的显示状态，由本插件负责折叠。
 
 ## 兼容性
 
-基于 pi `0.85.1` 的公开扩展 API（`registerMarkdownTransformer`、`ctx.ui.setToolsExpanded`、`ctx.ui.onTerminalInput`、`createWriteToolDefinition`、`registerCommand`、`appendEntry`、`SettingsList`）。
+基于 pi `0.85.1` 的公开扩展 API（`registerMarkdownTransformer`、`ctx.ui.setToolsExpanded`、`createWriteToolDefinition`、`registerCommand`、`appendEntry`、`SettingsList`）。
