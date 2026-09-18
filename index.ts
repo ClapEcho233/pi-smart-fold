@@ -410,6 +410,24 @@ function trimLineFiller(line: string): string {
     .replace(/[ \t]+$/, "");
 }
 
+/**
+ * Insert text into a rendered line's trailing padding, eating an equal
+ * number of padding columns so the line keeps its exact width (and thus its
+ * full-width background bar). Returns null when there is not enough padding.
+ */
+function insertIntoLinePadding(line: string, insert: string): string | null {
+  if (!insert) return line;
+  const resetMatch = line.match(/(?:\u001b\[[0-9;]*m)+$/);
+  const tail = resetMatch ? resetMatch[0] : "";
+  const bodyEnd = line.length - tail.length;
+  let end = bodyEnd;
+  while (end > 0 && (line[end - 1] === " " || line[end - 1] === "\t")) end--;
+  const insertWidth = displayWidth(insert);
+  if (bodyEnd - end < insertWidth) return null; // not enough padding
+  const keptPadding = " ".repeat(bodyEnd - end - insertWidth);
+  return line.slice(0, end) + insert + keptPadding + tail;
+}
+
 export default function smartFold(pi: ExtensionAPI): void {
   const extensionDir = resolveExtensionDir();
   const config: SmartFoldConfig = extensionDir
@@ -663,7 +681,7 @@ export default function smartFold(pi: ExtensionAPI): void {
     render(width: number): string[] {
       const lines = this.inner.render(width);
       if (lines.length === 0) return lines;
-      if (this.expanded) return lines.slice(); // expanded: everything, untruncated
+      const headerIndex = firstContentLine(lines);
 
       const stat = config.writeStat
         ? this.statFromMap
@@ -676,8 +694,29 @@ export default function smartFold(pi: ExtensionAPI): void {
             ` ${this.theme.fg("error", `-${stat.removed}`)}`
           : "";
 
+      if (this.expanded) {
+        // Expanded: everything, with the stat injected into the header line.
+        const out = lines.slice();
+        if (suffix) {
+          out[headerIndex] =
+            insertIntoLinePadding(out[headerIndex], suffix) ??
+            trimLineFiller(out[headerIndex]) + suffix;
+        }
+        return out;
+      }
+
       if (this.headerOnly && config.writeCollapsed === "header") {
-        const headerIndex = firstContentLine(lines);
+        // Some tools render their own shell (edit: renderShell "self" — no
+        // outer box). Keep their full-width background lines and inject the
+        // stat into the header line's padding so the bar keeps its size.
+        if (headerIndex > 0) {
+          const header = suffix
+            ? insertIntoLinePadding(lines[headerIndex], suffix) ??
+              trimLineFiller(lines[headerIndex]) + suffix
+            : lines[headerIndex];
+          return [lines[headerIndex - 1], header, lines[lines.length - 1]];
+        }
+        // Plain inner (write): the outer box pads — trim, then append.
         const header = suffix ? trimLineFiller(lines[headerIndex]) : lines[headerIndex];
         const out = [header];
         if (suffix) {
@@ -692,7 +731,6 @@ export default function smartFold(pi: ExtensionAPI): void {
 
       // Collapsed: single first content line, truncated to the terminal width
       // with an ellipsis (an extra `…` marks hidden continuation lines).
-      const headerIndex = firstContentLine(lines);
       let line = trimLineFiller(lines[headerIndex]);
       if (suffix) line += suffix;
       if (lines.length > headerIndex + 1) line += " …";

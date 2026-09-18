@@ -35,7 +35,7 @@
 - **write / edit 增删统计**：
   - write：执行**前**读取原文件内容，与写入内容做行级 diff（公共前后缀裁剪 + LCS），首行追加 **绿色 `+新增` / 红色 `-删除`**，如 `write src/index.ts +12 -3`；新文件 `+N -0`；超大文件（>8MB）跳过。统计随工具结果**持久化进会话文件**，恢复历史会话后依旧显示（本版本之前产生的旧写入没有记录，不显示）。
   - edit：直接对各 `edits` 的 `oldText → newText` 做行级 diff 并求和，如 `edit src/app.ts +2 -1`（参数流式传输时就实时更新）。
-- **write/edit 默认完全折叠，不显示任何代码内容/差异**：折叠时调用区和结果区都只剩一行头部（`writeCollapsed: header` 默认；pi 原生没有此能力，通过对 renderCall + renderResult 的双重包装实现 —— 结果区的 diff 在折叠时返回空组件，错误信息仍会显示）；点击 / `ctrl+o` 展开后才显示完整差异 / 语法高亮内容。可在设置中改回 `preview` 恢复 pi 原生预览。
+- **write/edit 默认完全折叠，不显示任何代码内容/差异**：折叠时调用区和结果区都只剩一行头部（`writeCollapsed: header` 默认；pi 原生没有此能力，通过对 renderCall + renderResult 的双重包装实现 —— 结果区的 diff 在折叠时返回空组件，错误信息仍会显示）；点击 / `ctrl+o` 展开后显示完整差异 / 语法高亮内容，**头部行在折叠和展开时都保留 `+N -M` 统计**（edit 自带外壳的背景条完整保留，统计注入行尾填充、行宽不变）。可在设置中改回 `preview` 恢复 pi 原生预览。
 - 实现方式为对 pi 内置工具的渲染包装（执行逻辑完全复用各 `create*ToolDefinition`）。
 
 ## 设置界面
