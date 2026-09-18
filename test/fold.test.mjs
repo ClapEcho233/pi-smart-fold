@@ -23,7 +23,6 @@ import {
 } from "../lib/fold.ts";
 import { defaultConfig, loadConfig, saveConfig } from "../lib/config.ts";
 import { ThinkingTracker, trailingThinkingText } from "../lib/thinking.ts";
-import { RevealController } from "../lib/reveal.ts";
 
 let passed = 0;
 const check = (name, fn) => {
@@ -327,84 +326,66 @@ check("config: broken JSON falls back to defaults", () => {
   }
 });
 
-// ------------------------------------------------------ RevealController ----
-check("RevealController: first render folds, second reveals", () => {
-  let t = 1_000;
-  const ctrl = new RevealController({ now: () => t, schedule: (cb) => cb() });
-  assert.equal(ctrl.shouldReveal("k", 80), false); // finalize render
-  t = 2_000;
-  assert.equal(ctrl.shouldReveal("k", 80), true); // post-click render
-  assert.equal(ctrl.shouldReveal("k", 80), true); // stays revealed
+// ------------------------------------------------------------ config ----
+check("config: defaults when file missing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
+  try {
+    assert.deepEqual(loadConfig(dir), defaultConfig);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
-check("RevealController: width change refolds", () => {
-  let t = 1_000;
-  const ctrl = new RevealController({ now: () => t, schedule: (cb) => cb() });
-  ctrl.shouldReveal("k", 80);
-  t = 2_000;
-  ctrl.shouldReveal("k", 80); // revealed
-  t = 3_000;
-  assert.equal(ctrl.shouldReveal("k", 100), false); // resize -> folded again
+check("config: save/load roundtrip with new fields", () => {
+  const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
+  try {
+    const next = {
+      toolsFold: false,
+      thinking: "tail",
+      writeStat: false,
+      writeCollapsed: "preview",
+    };
+    assert.equal(saveConfig(dir, next), true);
+    assert.deepEqual(loadConfig(dir), next);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
-check("RevealController: invalidation bursts roll back and heal", () => {
-  let t = 1_000;
-  let forced = 0;
-  const pending = [];
-  const flush = () => { const cbs = pending.splice(0); for (const cb of cbs) cb(); };
-  const ctrl = new RevealController({
-    now: () => t,
-    schedule: (cb) => pending.push(cb),
-    onInvalidation: () => { forced += 1; },
-    threshold: 3,
-  });
-  ctrl.noteTransform();
-  ctrl.noteTransform();
-  assert.equal(ctrl.shouldReveal("k", 80), false); // first render -> create only
-  ctrl.noteTransform();
-  ctrl.shouldReveal("k", 80); // increment inside the burst (would reveal)
-  ctrl.noteTransform();
-  ctrl.noteTransform();
-  flush(); // burst counted 5 > threshold 3 -> rollback + force + suppress
-  assert.equal(forced, 1);
-  t = 1_100; // inside the suppression window
-  assert.equal(ctrl.shouldReveal("k", 80), false); // healed back to folded, no increment
-  t = 5_000; // suppression over; a real post-click render reveals again
-  assert.equal(ctrl.shouldReveal("k", 80), true);
+check("config: migrates legacy thinkingFold boolean", () => {
+  const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
+  try {
+    writeFileSync(join(dir, "smart-fold.config.json"), '{"thinkingFold": false}', "utf8");
+    assert.deepEqual(loadConfig(dir).thinking, "off");
+    writeFileSync(join(dir, "smart-fold.config.json"), '{"thinkingFold": true}', "utf8");
+    assert.deepEqual(loadConfig(dir).thinking, "smart");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
-check("RevealController: click-sized bursts are not rolled back", () => {
-  let t = 1_000;
-  let forced = 0;
-  const ctrl = new RevealController({
-    now: () => t,
-    schedule: (cb) => cb(),
-    onInvalidation: () => { forced += 1; },
-    threshold: 8,
-  });
-  ctrl.noteTransform();
-  ctrl.noteTransform(); // click re-render: thinking + text of one message
-  assert.equal(ctrl.shouldReveal("k", 80), false);
-  t = 2_000;
-  ctrl.noteTransform();
-  assert.equal(ctrl.shouldReveal("k", 80), true); // revealed, no rollback
-  assert.equal(forced, 0);
+check("config: invalid values fall back to defaults", () => {
+  const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
+  try {
+    writeFileSync(
+      join(dir, "smart-fold.config.json"),
+      '{"thinking": "bogus", "writeCollapsed": 42, "writeStat": "yes", "toolsFold": 1}',
+      "utf8",
+    );
+    const loaded = loadConfig(dir);
+    assert.deepEqual(loaded.thinking, "smart");
+    assert.deepEqual(loaded.writeCollapsed, "header");
+    assert.deepEqual(loaded.writeStat, true);
+    assert.deepEqual(loaded.toolsFold, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
-check("RevealController: create-only bursts do not force a re-render", () => {
-  let forced = 0;
-  const ctrl = new RevealController({
-    schedule: (cb) => cb(),
-    onInvalidation: () => { forced += 1; },
-    threshold: 3,
-  });
-  for (let i = 0; i < 6; i++) ctrl.noteTransform(); // e.g. session restore
-  ctrl.shouldReveal("a", 80);
-  ctrl.shouldReveal("b", 80);
-  assert.equal(forced, 0); // no increments happened -> nothing to heal
-});
-check("RevealController: clear forgets everything", () => {
-  const ctrl = new RevealController({ schedule: (cb) => cb() });
-  ctrl.shouldReveal("k", 80);
-  ctrl.shouldReveal("k", 80);
-  ctrl.clear();
-  assert.equal(ctrl.shouldReveal("k", 80), false);
+check("config: broken JSON falls back to defaults", () => {
+  const dir = mkdtempSync(join(tmpdir(), "smart-fold-"));
+  try {
+    writeFileSync(join(dir, "smart-fold.config.json"), "{oops", "utf8");
+    assert.deepEqual(loadConfig(dir), defaultConfig);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ------------------------------------------------------ ThinkingTracker ----

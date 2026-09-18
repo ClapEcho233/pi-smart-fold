@@ -8,10 +8,13 @@
  *      - While the model thinks, the block shows a bold `Thinking… (8s)`
  *        label line, then the scrolling tail of the thinking text below it.
  *      - Once the message finishes, the block collapses to a single bold
- *        `Thought for 12.4s` line. Clicking the line walks through pi's
- *        native show/hide toggle; the second click reveals the full text
- *        with the `Thought for 12.4s` footer at the bottom (bold, so it is
- *        slightly distinct from the italic thinking content).
+ *        `Thought for 12.4s` line.
+ *      - Expansion is driven by ONE reliable switch: the `alt+t` shortcut
+ *        (and /fold expand) toggles every finished thinking block between
+ *        collapsed and full text (with the duration footer at the bottom).
+ *        Clicking a collapsed block only toggles pi's internal hidden state;
+ *        the extension owns that state's label text, so the native
+ *        "Thinking..." never appears — it shows our own hint instead.
  *      - Durations are measured per thinking run and persisted in the
  *        session, so restored sessions keep showing them.
  *   2. Tool output is collapsed on every session start (`session_start`
@@ -28,8 +31,10 @@
  * rendering is customized.
  *
  * Runtime control:
+ *   alt+t                          expand / collapse all finished thinking
  *   /fold                          open the /config-style settings list
  *   /fold thinking smart|tail|full|off
+ *   /fold expand on|off
  *   /fold tools on|off
  *   /fold writestat on|off
  *   /fold writecollapsed header|preview
@@ -63,7 +68,6 @@ import {
   type WriteCollapsedStyle,
 } from "./lib/config.ts";
 import { ThinkingTracker } from "./lib/thinking.ts";
-import { RevealController } from "./lib/reveal.ts";
 
 /** Best-effort resolve of this extension's directory (for the config file). */
 function resolveExtensionDir(): string | undefined {
@@ -123,6 +127,8 @@ interface CtxLike {
 }
 
 const MAX_WRITE_FILE_BYTES = 8 * 1024 * 1024;
+/** Shortcut that toggles all finished thinking blocks (collapsed ↔ full). */
+const EXPAND_SHORTCUT = "alt+t";
 
 export default function smartFold(pi: ExtensionAPI): void {
   const extensionDir = resolveExtensionDir();
@@ -140,30 +146,29 @@ export default function smartFold(pi: ExtensionAPI): void {
   const tracker = new ThinkingTracker();
 
   /**
-   * Click-to-reveal state for finalized thinking blocks (see lib/reveal.ts):
-   * pi renders such a block expanded on its 1st render and again after every
-   * second click (the render in between shows pi's native hidden label and
-   * does NOT run this transformer). So the first render folds, later renders
-   * reveal — except when a burst of transforms looks like a global
-   * re-render (theme change, layout), which is rolled back.
+   * Runtime switch for the alt+t toggle: when true, every finished thinking
+   * block renders its full text (with duration footer) instead of the folded
+   * `Thought for …` line. Deliberately not persisted — sessions start compact.
    */
-  const revealCtrl = new RevealController({
-    onInvalidation: () => {
-      // Rollback happened; force every message through the transformer again
-      // so accidentally-unfolded blocks heal back to their folded state.
-      try {
-        forceRerender();
-      } catch {
-        // Best-effort.
-      }
-    },
-  });
+  let expandAllThinking = false;
 
-  /** Set in session_start; re-renders every assistant message. */
-  let forceRerenderFn: (() => void) | undefined;
-  const forceRerender = (): void => {
+  /**
+   * Text shown by pi's internal hidden-thinking state. We own it so the
+   * native "Thinking..." label never appears anywhere (click toggles and the
+   * built-in ctrl+t alike show our hint instead).
+   */
+  const hiddenThinkingLabelText = (): string | undefined => {
+    if (config.thinking === "off") return undefined; // restore pi's default
+    return expandAllThinking
+      ? `Thought… · 按 ${EXPAND_SHORTCUT} 折叠全部思考`
+      : `Thought… · 按 ${EXPAND_SHORTCUT} 展开全部思考`;
+  };
+
+  /** Apply (or restore) the hidden-thinking label; re-renders all messages. */
+  const applyHiddenLabel = (ctx: CtxLike): void => {
+    if (!ctx.hasUI) return;
     try {
-      forceRerenderFn?.();
+      ctx.ui.setHiddenThinkingLabel?.(hiddenThinkingLabelText());
     } catch {
       // Best-effort.
     }
@@ -179,7 +184,6 @@ export default function smartFold(pi: ExtensionAPI): void {
   // 1) Thinking: live tail while streaming, folded line with duration after.
   // -------------------------------------------------------------------------
   pi.registerMarkdownTransformer((markdown, context) => {
-    revealCtrl.noteTransform(); // burst tracking for every message type
     if (context.messageType !== "assistant-thinking") return markdown;
     const mode = config.thinking;
     if (mode === "off") return markdown;
@@ -200,7 +204,7 @@ export default function smartFold(pi: ExtensionAPI): void {
     let ms = tracker.finalizedMs(key);
     if (ms === undefined) ms = tracker.finalizeIfMatches(markdown);
 
-    if (mode === "full" || revealCtrl.shouldReveal(key, width)) {
+    if (mode === "full" || expandAllThinking) {
       // Fully expanded: original text, with the duration footer at the bottom.
       return markdown.replace(/\s+$/, "") + expandedThinkingSuffix(ms);
     }
@@ -249,7 +253,6 @@ export default function smartFold(pi: ExtensionAPI): void {
     }
     writeStats.clear();
     writeRows.clear();
-    revealCtrl.clear();
   };
 
   // -------------------------------------------------------------------------
@@ -258,11 +261,8 @@ export default function smartFold(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const scoped = ctx as unknown as CtxLike;
     restoreFromBranch(scoped);
-    try {
-      forceRerenderFn = () => scoped.ui.setHiddenThinkingLabel?.();
-    } catch {
-      // Best-effort.
-    }
+    expandAllThinking = false; // sessions start compact
+    applyHiddenLabel(scoped);
     if (!config.toolsFold) return;
     if (!ctx.hasUI) return; // no-op guard for print / json modes
     try {
@@ -391,21 +391,28 @@ export default function smartFold(pi: ExtensionAPI): void {
   });
 
   // -------------------------------------------------------------------------
-  // 4) /fold — /config-style settings list.
+  // 4) alt+t — expand / collapse all finished thinking blocks.
+  // -------------------------------------------------------------------------
+  const applyExpandAll = (on: boolean, ctx: CtxLike): void => {
+    if (expandAllThinking === on) return;
+    expandAllThinking = on;
+    applyHiddenLabel(ctx); // also re-renders every message through the transformer
+  };
+
+  pi.registerShortcut(EXPAND_SHORTCUT, {
+    description: "smart-fold: 展开/折叠全部已完成的思考",
+    handler: async (ctx) => {
+      applyExpandAll(!expandAllThinking, ctx as unknown as CtxLike);
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // 5) /fold — /config-style settings list.
   // -------------------------------------------------------------------------
   const applyThinking = (mode: ThinkingMode, ctx: CtxLike): void => {
     config.thinking = mode;
     persist();
-    revealCtrl.clear();
-    if (ctx.hasUI) {
-      try {
-        // Re-render every assistant message through the markdown transformer
-        // (resets pi's hidden-thinking label to its default on the way).
-        ctx.ui.setHiddenThinkingLabel?.();
-      } catch {
-        // New content still picks the change up on next render.
-      }
-    }
+    applyHiddenLabel(ctx);
   };
 
   const applyToolsFold = (on: boolean, ctx: CtxLike): void => {
@@ -431,11 +438,11 @@ export default function smartFold(pi: ExtensionAPI): void {
   };
 
   const statusLine = (): string =>
-    `smart-fold — thinking: ${config.thinking} · 工具输出: ${
-      config.toolsFold ? "启动时折叠" : "启动时展开"
-    } · write统计: ${config.writeStat ? "开" : "关"} · write折叠: ${
-      config.writeCollapsed === "header" ? "仅首行" : "保留预览"
-    }`;
+    `smart-fold — thinking: ${config.thinking} · 思考展开: ${
+      expandAllThinking ? "开" : "关"
+    } · 工具输出: ${config.toolsFold ? "启动时折叠" : "启动时展开"} · write统计: ${
+      config.writeStat ? "开" : "关"
+    } · write折叠: ${config.writeCollapsed === "header" ? "仅首行" : "保留预览"}`;
 
   const openSettings = async (ctx: CtxLike & {
     ui: CtxLike["ui"] & {
@@ -457,7 +464,14 @@ export default function smartFold(pi: ExtensionAPI): void {
           currentValue: config.thinking,
           values: ["smart", "tail", "full", "off"],
           description:
-            "smart: 思考中首行 Thinking…(时长)+滚动结尾；结束后折叠为 Thought for 时长；点击两次查看全文（底部附时长行）",
+            "smart: 思考中显示 Thinking…(时长)+滚动结尾；结束后折叠为 Thought for 时长",
+        },
+        {
+          id: "expand",
+          label: "展开全部思考",
+          currentValue: expandAllThinking ? "on" : "off",
+          values: ["on", "off"],
+          description: `等同于 ${EXPAND_SHORTCUT} 快捷键：临时展开/折叠全部已完成的思考（不持久化）`,
         },
         {
           id: "tools",
@@ -488,6 +502,7 @@ export default function smartFold(pi: ExtensionAPI): void {
         getSettingsListTheme(),
         (id, value) => {
           if (id === "thinking") applyThinking(value as ThinkingMode, ctx);
+          else if (id === "expand") applyExpandAll(value === "on", ctx);
           else if (id === "tools") applyToolsFold(value === "on", ctx);
           else if (id === "writeStat") applyWriteStat(value === "on");
           else if (id === "writeCollapsed") applyWriteCollapsed(value as WriteCollapsedStyle);
@@ -511,14 +526,14 @@ export default function smartFold(pi: ExtensionAPI): void {
   };
 
   pi.registerCommand("fold", {
-    description: "smart-fold 设置（选择式界面）：thinking 折叠 / 工具输出 / write 统计",
+    description: "smart-fold 设置（选择式界面）：thinking 折叠 / 展开 / 工具输出 / write 统计",
     getArgumentCompletions: (prefix: string) => {
       const make = (values: string[]) => values.map((value) => ({ value, label: value }));
       const trimmed = prefix.trimStart();
       const spaceIndex = trimmed.indexOf(" ");
       if (spaceIndex === -1) {
-        const hits = ["thinking", "tools", "writestat", "writecollapsed"].filter((option) =>
-          option.startsWith(trimmed.toLowerCase()),
+        const hits = ["thinking", "expand", "tools", "writestat", "writecollapsed"].filter(
+          (option) => option.startsWith(trimmed.toLowerCase()),
         );
         return hits.length > 0 ? make(hits) : null;
       }
@@ -526,6 +541,7 @@ export default function smartFold(pi: ExtensionAPI): void {
       const sub = trimmed.slice(spaceIndex + 1).toLowerCase();
       const options: Record<string, string[]> = {
         thinking: ["smart", "tail", "full", "off"],
+        expand: ["on", "off"],
         tools: ["on", "off"],
         writestat: ["on", "off"],
         writecollapsed: ["header", "preview"],
@@ -561,6 +577,16 @@ export default function smartFold(pi: ExtensionAPI): void {
         }
         applyThinking(mode, scoped);
         ctx.ui.notify(`thinking: ${mode} — 已保存`, "info");
+        return;
+      }
+
+      if (target === "expand") {
+        if (value !== "on" && value !== "off") {
+          ctx.ui.notify(`用法: /fold expand on|off（或按 ${EXPAND_SHORTCUT}）`, "warning");
+          return;
+        }
+        applyExpandAll(value === "on", scoped);
+        ctx.ui.notify(`展开全部思考: ${value === "on" ? "开" : "关"}`, "info");
         return;
       }
 
@@ -604,7 +630,7 @@ export default function smartFold(pi: ExtensionAPI): void {
       }
 
       ctx.ui.notify(
-        "用法: /fold（打开设置）或 /fold [thinking|tools|writestat|writecollapsed] <值>",
+        "用法: /fold（打开设置）或 /fold [thinking|expand|tools|writestat|writecollapsed] <值>",
         "warning",
       );
     },
