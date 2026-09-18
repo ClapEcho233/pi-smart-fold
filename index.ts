@@ -7,6 +7,10 @@
  *   1. Thinking blocks:
  *      - While the model thinks, the block shows a bold `Thinking… (8s)`
  *        label line, then the scrolling tail of the thinking text below it.
+ *      - Clicking the live block toggles directly between that scrolling
+ *        tail and the full text so far — no intermediate label state. In
+ *        full view the ticking bold `Thinking… (8s)` line stays pinned at
+ *        the bottom of the block while the text grows above it.
  *      - Once the message finishes, the block collapses to a single bold
  *        `Thought for 12.4s` line.
  *      - Click a collapsed block once — that single block expands to its
@@ -76,6 +80,7 @@ import {
   expandedThinkingSuffix,
   foldedThinkingLine,
   hashText,
+  liveExpandedSuffix,
   liveThinkingLine,
 } from "./lib/fold.ts";
 import {
@@ -136,6 +141,13 @@ function resolveExtensionDir(): string | undefined {
 //      clicks exactly (seeding performed in the same pass is excluded, and
 //      clears are ignored) and record which block (content hash) was clicked
 //      plus a monotonic click sequence.
+//   4. REDIRECT clicks on the run that is still being written. pi's handler
+//      just toggled that run to the hidden-label state; we flip the override
+//      straight back to visible and toggle our own tail ↔ full mode instead,
+//      so one click switches between the scrolling tail and the full text
+//      (timing line pinned at the bottom) — the hidden middle state never
+//      shows. The MouseRegion click closure is rebuilt from the corrected
+//      map on every render, so each later click hits the same redirect.
 //
 // The markdown transformer uses that click signal only to mark a block as
 // user-revealed (add-only), so unflagged re-renders of expanded blocks keep
@@ -149,6 +161,14 @@ interface SmartFoldGlobalState {
   behavior: "seed" | "clear" | "inert";
   /** Look up (or finalize) the duration of a thinking run's joined text. */
   durationFor(runText: string): number | undefined;
+  /**
+   * True when a run has no finalized duration yet, i.e. it is the run still
+   * being written and currently renders in live mode. Pure — never closes
+   * the tracker's open group (unlike `durationFor`).
+   */
+  isLiveRun(runText: string): boolean;
+  /** Called when the user collapses a live run back to the scrolling tail. */
+  onLiveCollapse?(runText: string): void;
 }
 
 type SmartFoldGlobal = typeof globalThis & { [SF_STATE]?: SmartFoldGlobalState };
@@ -228,13 +248,11 @@ function installThinkingDisplayPatch(): void {
               }
               self.hiddenThinkingLabel = collapsedLabelText(runs, state);
             }
-          } else if (state.behavior === "seed") {
-            // While streaming, the label only shows after the user clicks the
-            // live tail hidden — point them at the second click.
-            self.hiddenThinkingLabel = "Thinking… · 再次点击展开";
           }
+          // (While streaming, the live run is kept visible by the redirect
+          // below, so it never renders the hidden label.)
 
-          const current = Array.from(overrides.entries());
+          let current = Array.from(overrides.entries());
           if (
             previous !== undefined &&
             previous.length + current.length > 0 &&
@@ -244,8 +262,32 @@ function installThinkingDisplayPatch(): void {
             const changedRun = firstChangedRun(previous, current, seeded);
             if (changedRun !== null) {
               const runText = thinkingRunText(self.lastMessage ?? message, changedRun);
-              const openNow = new Map(current).get(changedRun) === false;
-              recordThinkingClick(runText, openNow);
+              const clickedHidden = new Map(current).get(changedRun) === true;
+              if (
+                clickedHidden &&
+                !finalized &&
+                runText !== null &&
+                state.isLiveRun?.(runText) === true // live = no finalized duration yet
+              ) {
+                // Single-click tail ↔ full on the run still being written:
+                // pi just flipped it to the hidden-label state. Redirect —
+                // keep the run visible and switch our own mode instead. The
+                // click closure is rebuilt from the corrected map, so every
+                // later click lands here again: no hidden middle state.
+                const openPrefix = openStreamingPrefix();
+                if (openPrefix !== null && runText.startsWith(openPrefix)) {
+                  state.onLiveCollapse?.(runText); // drop any stale reveal mark
+                  setStreamingOpenPrefix(null); // full → scrolling tail
+                } else {
+                  recordRevealClick(runText); // tail → full text so far
+                  setStreamingOpenPrefix(runText);
+                }
+                overrides.set(changedRun, false);
+                current = Array.from(overrides.entries());
+              } else if (!clickedHidden) {
+                // Click that opened a finished run: mark it revealed.
+                recordRevealClick(runText);
+              }
             }
           }
           self[OVERRIDE_SNAPSHOT] = current;
@@ -320,16 +362,24 @@ type ClickGlobal = typeof globalThis & {
 };
 
 /**
- * Record a thinking click. `open` is the run's new visibility (false = the
- * user clicked it open). For the still-streaming run we keep the clicked text
- * as a prefix — thinking text only grows, so every later render of the same
- * run starts with it and stays expanded until clicked closed.
+ * Record a thinking click that opens a block: stamps the time and the
+ * block's content hash so the transformer's re-render (within the click
+ * window) marks it user-revealed (add-only).
  */
-function recordThinkingClick(runText: string | null, open: boolean): void {
+function recordRevealClick(runText: string | null): void {
   const clickGlobal = globalThis as ClickGlobal;
   clickGlobal[CLICK_AT] = Date.now();
-  if (runText !== null) clickGlobal[CLICK_HASH] = hashText(runText);
-  clickGlobal[CLICK_OPEN_PREFIX] = open && runText !== null ? runText : null;
+  clickGlobal[CLICK_HASH] = runText !== null ? hashText(runText) : undefined;
+}
+
+/**
+ * Set (or clear) the streaming run the user clicked open. Thinking text
+ * only grows, so every later render of the same run starts with this prefix
+ * and stays expanded until toggled back. Only live-run clicks manage this;
+ * clicks on finished runs never clobber it.
+ */
+function setStreamingOpenPrefix(runText: string | null): void {
+  (globalThis as ClickGlobal)[CLICK_OPEN_PREFIX] = runText;
 }
 
 /** Prefix of the streaming run the user clicked open, if any. */
@@ -451,6 +501,10 @@ export default function smartFold(pi: ExtensionAPI): void {
             : "seed",
       durationFor: (runText: string) =>
         tracker.finalizedMs(hashText(runText)) ?? tracker.finalizeIfMatches(runText),
+      isLiveRun: (runText: string) => tracker.finalizedMs(hashText(runText)) === undefined,
+      onLiveCollapse: (runText: string) => {
+        revealedBlocks.delete(hashText(runText));
+      },
     };
   };
 
@@ -531,20 +585,27 @@ export default function smartFold(pi: ExtensionAPI): void {
 
     if (context.isStreaming) {
       // Finished runs of the still-streaming message behave like finalized
-      // blocks: hidden label by default, full text when clicked open.
+      // blocks: folded duration line by default; full text with the footer
+      // when clicked open — including one the user opened while it streamed
+      // (identified by the open prefix) — or when expand-all is on.
       if (ms !== undefined) {
-        return revealedBlocks.has(key)
-          ? markdown.replace(/\s+$/, "") + expandedThinkingSuffix(ms)
-          : foldedThinkingLine(markdown, ms, width, "smart");
+        const openPrefix = openStreamingPrefix();
+        const open =
+          revealedBlocks.has(key) ||
+          (openPrefix !== null && markdown.startsWith(openPrefix)) ||
+          mode === "full" ||
+          expandAllThinking;
+        if (open) {
+          return markdown.replace(/\s+$/, "") + expandedThinkingSuffix(ms);
+        }
+        return foldedThinkingLine(markdown, ms, width, mode === "tail" ? "tail" : "smart");
       }
-      // The run that is still being written: live tail by default; full text
-      // so far when the user clicked it open (prefix identifies the run).
+      // The run that is still being written: live tail by default; the full
+      // text so far when the user clicked it open (prefix identifies the
+      // run), with the ticking `Thinking… (Ns)` line pinned at the bottom.
       const openPrefix = openStreamingPrefix();
       if (openPrefix !== null && markdown.startsWith(openPrefix)) {
-        const elapsed = tracker.liveElapsedMs();
-        const label =
-          elapsed === undefined ? "" : `**Thinking… (${formatDuration(elapsed, "live")})**\n\n`;
-        return label + markdown;
+        return markdown.replace(/\s+$/, "") + liveExpandedSuffix(tracker.liveElapsedMs());
       }
       return liveThinkingLine(markdown, tracker.liveElapsedMs(), width);
     }
@@ -966,7 +1027,7 @@ export default function smartFold(pi: ExtensionAPI): void {
           currentValue: config.thinking,
           values: ["smart", "tail", "full", "off"],
           description:
-            "smart: 思考中显示 Thinking…(时长)+滚动结尾；结束后折叠为 Thought for 时长；点击一次展开/收起单块",
+            "smart: 思考中显示 Thinking…(时长)+滚动结尾，点击在 滚动结尾↔完整全文 间切换（完整显示时计时行固定在底部）；结束后折叠为 Thought for 时长，点击一次展开/收起",
         },
         {
           id: "expand",
@@ -1085,7 +1146,7 @@ export default function smartFold(pi: ExtensionAPI): void {
 
       if (target === "expand") {
         if (value !== "on" && value !== "off") {
-          ctx.ui.notify("用法: /fold expand on|off（备用；日常点击思考块两次展开/收起）", "warning");
+          ctx.ui.notify("用法: /fold expand on|off（备用；日常单击思考块切换展开/收起）", "warning");
           return;
         }
         applyExpandAll(value === "on", scoped);

@@ -330,6 +330,16 @@ export function foldedThinkingLine(
 }
 
 /**
+ * Bold live-timing footer appended below fully-expanded thinking text while
+ * the run is still streaming (`\n\n**Thinking… (8s)**`), or an empty string
+ * when the elapsed time is unknown. Keeps updating at the bottom of the
+ * block while the full text grows.
+ */
+export function liveExpandedSuffix(ms: number | undefined): string {
+  return ms === undefined ? "" : `\n\n**Thinking… (${formatDuration(ms, "live")})**`;
+}
+
+/**
  * Bold duration footer appended below fully-expanded thinking text
  * (`\n\n**Thought for 12.4s**`), or an empty string when unknown.
  */

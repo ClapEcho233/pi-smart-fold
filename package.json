@@ -4,13 +4,20 @@
   "description": "pi coding-agent extension: collapse tool output at startup and fold thinking blocks to a live last line",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi", "pi-extension", "pi-package"],
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package"
+  ],
   "main": "index.ts",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "scripts": {
-    "test": "node test/fold.test.mjs"
+    "test": "node test/fold.test.mjs",
+    "test:sim": "node test/click-sim.mjs"
   },
   "engines": {
     "node": ">=22.18"

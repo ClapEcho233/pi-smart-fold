@@ -20,6 +20,7 @@ import {
   countEditsLineDiff,
   expandedThinkingSuffix,
   foldedThinkingLine,
+  liveExpandedSuffix,
   liveThinkingLine,
 } from "../lib/fold.ts";
 import { defaultConfig, loadConfig, saveConfig } from "../lib/config.ts";
@@ -286,6 +287,14 @@ check("foldedThinkingLine: tail keeps the tail + bold duration", () => {
 check("expandedThinkingSuffix: bold footer or empty", () => {
   assert.equal(expandedThinkingSuffix(61_500), "\n\n**Thought for 1m01s**");
   assert.equal(expandedThinkingSuffix(undefined), "");
+});
+check("liveExpandedSuffix: bold ticking footer at the bottom", () => {
+  assert.equal(liveExpandedSuffix(8_000), "\n\n**Thinking… (8s)**");
+  assert.equal(liveExpandedSuffix(91_000), "\n\n**Thinking… (1m31s)**");
+  assert.equal(liveExpandedSuffix(undefined), "");
+  // appended after the full text, the timing line ends up as the last line
+  const view = "first thought\nsecond thought" + liveExpandedSuffix(8_000);
+  assert.equal(view.split("\n").at(-1), "**Thinking… (8s)**");
 });
 
 // ------------------------------------------------------------ config ----
