@@ -9,12 +9,12 @@
  *        label line, then the scrolling tail of the thinking text below it.
  *      - Once the message finishes, the block collapses to a single bold
  *        `Thought for 12.4s` line.
- *      - Click a collapsed block, then click again — that single block
- *        expands to its full text (with the duration footer at the bottom);
- *        the same two-click gesture collapses it again. The first click only
- *        flips pi's internal hidden state (our hint label shows briefly);
- *        the second click re-renders the block, which is when the extension
- *        toggles it.
+ *      - Click a collapsed block once — that single block expands to its
+ *        full text (with the duration footer at the bottom); click once more
+ *        to collapse it again. Finished thinking starts in pi's hidden state
+ *        (the prototype patch seeds it and writes the per-message label
+ *        `Thought for 12.4s`), so each click lands directly on the expanded
+ *        rendering — no intermediate state.
  *      - Click detection is exact, not heuristic: pi's click handler mutates
  *        the component's internal `thinkingVisibilityOverrides` map before
  *        re-rendering. The extension observes that mutation through a small
@@ -72,6 +72,7 @@ import {
   countEditsLineDiff,
   countLineDiff,
   displayWidth,
+  formatDuration,
   expandedThinkingSuffix,
   foldedThinkingLine,
   hashText,
@@ -108,35 +109,53 @@ function resolveExtensionDir(): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Click observation (exact, not heuristic)
+// Thinking display state (exact, not heuristic): single-click expand
 // ---------------------------------------------------------------------------
 //
-// pi's click handler on a thinking block does:
+// pi's thinking click handler does:
 //     this.thinkingVisibilityOverrides.set(runIndex, !hidden);
 //     this.updateContent(this.lastMessage);
 // and ctrl+t / the settings toggle do:
 //     this.thinkingVisibilityOverrides.clear();
 //     this.updateContent(...)
 //
-// We patch AssistantMessageComponent.prototype.updateContent (idempotently,
-// shared across extension reloads via Symbol.for keys) to diff that map
-// against a per-component snapshot. A set-style change (click) records a
-// global timestamp; clears are ignored. The markdown transformer then knows
-// a render was click-triggered — no thresholds, no counting, no forced
-// re-renders.
+// A block renders "hidden" (pi's native label state) when
+//     overrides.get(runIndex) ?? hideThinkingBlock
+// is true. We patch AssistantMessageComponent.prototype.updateContent
+// (idempotently, shared across extension reloads via Symbol.for keys) to:
+//
+//   1. SEED every thinking run of a FINALIZED message with a hidden override
+//      when it has none yet. Finished thinking therefore starts collapsed in
+//      the hidden state — and since we also set the component's label text
+//      per message (`Thought for 12.4s`), the collapsed line keeps its
+//      duration. One click then flips the run to expanded (our transformer
+//      renders the full text), one click flips it back. Single click.
+//   2. CLEAR the overrides when expand-all is requested (mode "full" or the
+//      expand toggle), so every run renders expanded.
+//   3. DIFF the overrides map against a per-component snapshot to observe
+//      clicks exactly (seeding performed in the same pass is excluded, and
+//      clears are ignored) and record which block (content hash) was clicked
+//      plus a monotonic click sequence.
+//
+// The markdown transformer uses that click signal only to mark a block as
+// user-revealed (add-only), so unflagged re-renders of expanded blocks keep
+// showing the full text and global re-renders never fake a click.
 
-const LAST_TOGGLE = Symbol.for("pi-smart-fold.lastToggleAt");
-const TOGGLE_SEQ = Symbol.for("pi-smart-fold.toggleSeq");
-const CLICKED_HASH = Symbol.for("pi-smart-fold.clickedHash");
+const SF_STATE = Symbol.for("pi-smart-fold.state");
 const OVERRIDE_SNAPSHOT = Symbol.for("pi-smart-fold.overrideSnapshot");
-type ToggleGlobal = typeof globalThis & {
-  [LAST_TOGGLE]?: number;
-  [TOGGLE_SEQ]?: number;
-  [CLICKED_HASH]?: string;
-};
 
-/** How long after a click its re-render is expected (generous for slow frames). */
-const TOGGLE_WINDOW_MS = 250;
+interface SmartFoldGlobalState {
+  /** "smart" | "tail" => seed hidden; "full" => clear; "off" => inert. */
+  behavior: "seed" | "clear" | "inert";
+  /** Look up (or finalize) the duration of a thinking run's joined text. */
+  durationFor(runText: string): number | undefined;
+}
+
+type SmartFoldGlobal = typeof globalThis & { [SF_STATE]?: SmartFoldGlobalState };
+
+function smartFoldState(): SmartFoldGlobalState | undefined {
+  return (globalThis as SmartFoldGlobal)[SF_STATE];
+}
 
 function sameOverrideEntries(
   a: Array<[number, boolean]>,
@@ -153,18 +172,21 @@ function sameOverrideEntries(
 function firstChangedRun(
   previous: Array<[number, boolean]>,
   current: Array<[number, boolean]>,
+  ignore: Set<number>,
 ): number | null {
   const currentMap = new Map(current);
   for (const [run, value] of previous) {
+    if (ignore.has(run)) continue;
     if (currentMap.get(run) !== value) return run; // value flipped
   }
   for (const [run] of current) {
+    if (ignore.has(run)) continue;
     if (!previous.some(([pRun]) => pRun === run)) return run; // newly added
   }
   return null;
 }
 
-function installThinkingClickObserver(): void {
+function installThinkingDisplayPatch(): void {
   const proto = (
     AssistantMessageComponent as unknown as {
       prototype?: { updateContent?: (...args: unknown[]) => unknown };
@@ -177,34 +199,54 @@ function installThinkingClickObserver(): void {
     const patched = function (this: unknown, message: unknown, isStreaming?: boolean) {
       const self = this as {
         thinkingVisibilityOverrides?: Map<number, boolean>;
+        hiddenThinkingLabel?: string;
+        isStreaming?: boolean;
+        lastMessage?: unknown;
         [key: symbol]: Array<[number, boolean]> | undefined;
       };
       try {
+        const state = smartFoldState();
         const overrides = self.thinkingVisibilityOverrides;
-        if (overrides instanceof Map) {
+        if (state && state.behavior !== "inert" && overrides instanceof Map) {
           const previous = self[OVERRIDE_SNAPSHOT];
+          const seeded = new Set<number>();
+          const finalized =
+            (isStreaming === undefined ? self.isStreaming !== true : isStreaming === false);
+
+          if (finalized) {
+            const runs = thinkingRuns(self.lastMessage ?? message);
+            if (state.behavior === "clear") {
+              if (overrides.size > 0) overrides.clear();
+            } else if (runs.length > 0) {
+              // Seed finished thinking runs as hidden (single-click expand),
+              // and refresh the per-message hidden label with its duration.
+              for (let run = 0; run < runs.length; run++) {
+                if (!overrides.has(run)) {
+                  overrides.set(run, true);
+                  seeded.add(run);
+                }
+              }
+              self.hiddenThinkingLabel = collapsedLabelText(runs, state);
+            }
+          }
+
           const current = Array.from(overrides.entries());
           if (
             previous !== undefined &&
             previous.length + current.length > 0 &&
-            !(current.length === 0 && previous.length > 0) && // clear = ctrl+t/settings
+            !(current.length === 0 && previous.length > 0) && // clear = ctrl+t/settings/expand-all
             !sameOverrideEntries(previous, current)
           ) {
-            const toggleGlobal = globalThis as ToggleGlobal;
-            // Which run was toggled? (a click changes exactly one entry)
-            const changedRun = firstChangedRun(previous, current);
-            const runText =
-              changedRun === null
-                ? null
-                : thinkingRunText((self as { lastMessage?: unknown }).lastMessage, changedRun);
-            toggleGlobal[LAST_TOGGLE] = Date.now();
-            toggleGlobal[TOGGLE_SEQ] = (toggleGlobal[TOGGLE_SEQ] ?? 0) + 1;
-            if (runText !== null) toggleGlobal[CLICKED_HASH] = hashText(runText);
+            const changedRun = firstChangedRun(previous, current, seeded);
+            if (changedRun !== null) {
+              const runText = thinkingRunText(self.lastMessage ?? message, changedRun);
+              recordThinkingClick(runText);
+            }
           }
           self[OVERRIDE_SNAPSHOT] = current;
         }
       } catch {
-        // Observation is best-effort.
+        // Display customization is best-effort; never break pi rendering.
       }
       return (original as (this: unknown, m: unknown, s?: boolean) => unknown).call(
         this,
@@ -215,20 +257,16 @@ function installThinkingClickObserver(): void {
     Object.defineProperty(patched, "__smartFoldPatched", { value: true });
     proto.updateContent = patched as typeof original;
   } catch {
-    // Best-effort: without the patch, clicks simply won't expand.
+    // Best-effort: without the patch, thinking falls back to native behavior.
   }
 }
 
-/**
- * Joined text of the `wantedRunIndex`-th thinking run of a message — mirrors
- * exactly how pi's AssistantMessageComponent groups consecutive thinking
- * blocks into runs (blocks trimmed, non-empty only, joined with a blank line).
- */
-function thinkingRunText(message: unknown, wantedRunIndex: number): string | null {
+/** Joined texts of every thinking run in a message, in run order. */
+function thinkingRuns(message: unknown): string[] {
   const content = (message as { content?: Array<{ type?: string; thinking?: string }> })
     ?.content;
-  if (!Array.isArray(content)) return null;
-  let runIndex = 0;
+  if (!Array.isArray(content)) return [];
+  const runs: string[] = [];
   for (let i = 0; i < content.length; i++) {
     if (content[i]?.type !== "thinking") continue;
     const blocks: string[] = [];
@@ -239,27 +277,52 @@ function thinkingRunText(message: unknown, wantedRunIndex: number): string | nul
       if (text) blocks.push(text);
     }
     i--;
-    if (runIndex++ === wantedRunIndex) {
-      return blocks.length > 0 ? blocks.join("\n\n") : null;
-    }
+    if (blocks.length > 0) runs.push(blocks.join("\n\n"));
   }
-  return null;
+  return runs;
 }
 
-/** Monotonic id of the last observed thinking-click (0 = none). */
-function lastClickSeq(): number {
-  return (globalThis as ToggleGlobal)[TOGGLE_SEQ] ?? 0;
+/**
+ * Joined text of the `wantedRunIndex`-th thinking run of a message — mirrors
+ * exactly how pi's AssistantMessageComponent groups consecutive thinking
+ * blocks into runs (blocks trimmed, non-empty only, joined with a blank line).
+ */
+function thinkingRunText(message: unknown, wantedRunIndex: number): string | null {
+  return thinkingRuns(message)[wantedRunIndex] ?? null;
 }
+
+/** Collapsed label text for a message's thinking runs (bold via SGR). */
+function collapsedLabelText(runs: string[], state: SmartFoldGlobalState): string {
+  let text: string;
+  if (runs.length === 1) {
+    const ms = state.durationFor(runs[0]);
+    text = ms === undefined ? "Thought…" : `Thought for ${formatDuration(ms, "final")}`;
+  } else {
+    text = "Thought…";
+  }
+  return `\u001b[1m${text}\u001b[22m`;
+}
+
+// Click recording ------------------------------------------------------------
+
+const CLICK_AT = Symbol.for("pi-smart-fold.clickAt");
+const CLICK_HASH = Symbol.for("pi-smart-fold.clickHash");
+type ClickGlobal = typeof globalThis & { [CLICK_AT]?: number; [CLICK_HASH]?: string };
+
+function recordThinkingClick(runText: string | null): void {
+  const clickGlobal = globalThis as ClickGlobal;
+  clickGlobal[CLICK_AT] = Date.now();
+  if (runText !== null) clickGlobal[CLICK_HASH] = hashText(runText);
+}
+
+/** How long after a click its re-render is expected (generous for slow frames). */
+const CLICK_WINDOW_MS = 250;
 
 /** Info about the most recent thinking-click, if it identified a block. */
-function lastClickInfo(): { seq: number; at: number; hash: string | undefined } | undefined {
-  const toggleGlobal = globalThis as ToggleGlobal;
-  if (toggleGlobal[TOGGLE_SEQ] === undefined) return undefined;
-  return {
-    seq: toggleGlobal[TOGGLE_SEQ]!,
-    at: toggleGlobal[LAST_TOGGLE] ?? 0,
-    hash: toggleGlobal[CLICKED_HASH],
-  };
+function lastClickInfo(): { at: number; hash: string | undefined } | undefined {
+  const clickGlobal = globalThis as ClickGlobal;
+  if (clickGlobal[CLICK_AT] === undefined) return undefined;
+  return { at: clickGlobal[CLICK_AT]!, hash: clickGlobal[CLICK_HASH] };
 }
 
 /** Renderer-facing theme subset (avoids coupling to the full Theme type). */
@@ -331,12 +394,28 @@ export default function smartFold(pi: ExtensionAPI): void {
     if (extensionDir) saveConfig(extensionDir, config);
   };
 
-  installThinkingClickObserver();
+  installThinkingDisplayPatch();
+
+  /** Publish the display behavior the prototype patch reads on every render. */
+  const publishState = (): void => {
+    (globalThis as SmartFoldGlobal)[SF_STATE] = {
+      behavior:
+        config.thinking === "off"
+          ? "inert"
+          : config.thinking === "full" || expandAllThinking
+            ? "clear"
+            : "seed",
+      durationFor: (runText: string) =>
+        tracker.finalizedMs(hashText(runText)) ?? tracker.finalizeIfMatches(runText),
+    };
+  };
 
   // Runtime state -----------------------------------------------------------
 
   /** Thinking-run timing (live elapsed + finalized durations by content hash). */
   const tracker = new ThinkingTracker();
+  let expandAllThinking = false;
+  publishState(); // the initial chat build can render before session_start fires
 
   /**
    * Content hashes of finished thinking blocks the user expanded by clicking.
@@ -344,16 +423,11 @@ export default function smartFold(pi: ExtensionAPI): void {
    * inert and resize keeps user intent.
    */
   const revealedBlocks = new Set<string>();
-  /** Clicks already applied per block (one toggle per click event). */
-  const appliedClicks = new Map<string, number>();
 
   /**
    * Expand-all fallback (settings item / /fold expand). Per-block clicks are
-   * the primary interaction; this covers "show me everything" and works even
-   * if the click observer could not be installed.
+   * the primary interaction; this covers "show me everything".
    */
-  let expandAllThinking = false;
-
   /**
    * Text shown by pi's internal hidden-thinking state (first click of the
    * two-click gesture, and ctrl+t). We own it so the native "Thinking..."
@@ -361,7 +435,7 @@ export default function smartFold(pi: ExtensionAPI): void {
    */
   const hiddenThinkingLabelText = (): string | undefined => {
     if (config.thinking === "off") return undefined; // restore pi's default
-    return "Thought… · 再次点击展开 / 收起";
+    return "Thought…"; // per-message labels (with durations) come from the patch
   };
 
   /** Apply (or restore) the hidden-thinking label; re-renders all messages. */
@@ -405,21 +479,19 @@ export default function smartFold(pi: ExtensionAPI): void {
     let ms = tracker.finalizedMs(key);
     if (ms === undefined) ms = tracker.finalizeIfMatches(markdown);
 
-    // A click on this block re-renders it shortly after the click handler
-    // mutated that block's visibility override. The observer recorded exactly
-    // which block (by content hash) was clicked — toggle only that one, and
-    // only once per click event (the sequence id stays unique even for
-    // clicks within the same millisecond).
+    // Finished thinking starts in pi's hidden state (the prototype patch
+    // seeds it), so an expanded render here means the user clicked this block
+    // open — the observer recorded exactly which block (by content hash).
+    // Mark it revealed (add-only): collapse happens by clicking back to the
+    // hidden label, which never runs this transformer.
     const click = lastClickInfo();
     if (
       click &&
-      Date.now() - click.at <= TOGGLE_WINDOW_MS &&
+      Date.now() - click.at <= CLICK_WINDOW_MS &&
       click.hash === key &&
-      appliedClicks.get(key) !== click.seq
+      !revealedBlocks.has(key)
     ) {
-      appliedClicks.set(key, click.seq);
-      if (revealedBlocks.has(key)) revealedBlocks.delete(key);
-      else revealedBlocks.add(key);
+      revealedBlocks.add(key);
       if (revealedBlocks.size > MAX_REVEALED_BLOCKS) revealedBlocks.clear();
     }
 
@@ -481,8 +553,8 @@ export default function smartFold(pi: ExtensionAPI): void {
     const scoped = ctx as unknown as CtxLike;
     restoreFromBranch(scoped);
     revealedBlocks.clear(); // sessions start compact
-    appliedClicks.clear();
     expandAllThinking = false;
+    publishState();
     applyHiddenLabel(scoped);
     if (!config.toolsFold) return;
     if (!ctx.hasUI) return; // no-op guard for print / json modes
@@ -682,11 +754,13 @@ export default function smartFold(pi: ExtensionAPI): void {
   const applyThinking = (mode: ThinkingMode, ctx: CtxLike): void => {
     config.thinking = mode;
     persist();
+    publishState();
     applyHiddenLabel(ctx);
   };
 
   const applyExpandAll = (on: boolean, ctx: CtxLike): void => {
     expandAllThinking = on;
+    publishState();
     applyHiddenLabel(ctx); // re-renders every message through the transformer
   };
 
@@ -739,7 +813,7 @@ export default function smartFold(pi: ExtensionAPI): void {
           currentValue: config.thinking,
           values: ["smart", "tail", "full", "off"],
           description:
-            "smart: 思考中显示 Thinking…(时长)+滚动结尾；结束后折叠为 Thought for 时长；点击两次展开/收起单块",
+            "smart: 思考中显示 Thinking…(时长)+滚动结尾；结束后折叠为 Thought for 时长；点击一次展开/收起单块",
         },
         {
           id: "expand",
