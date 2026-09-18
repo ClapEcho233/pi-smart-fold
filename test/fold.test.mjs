@@ -17,6 +17,7 @@ import {
   formatDuration,
   hashText,
   countLineDiff,
+  countEditsLineDiff,
   expandedThinkingSuffix,
   foldedThinkingLine,
   liveThinkingLine,
@@ -222,6 +223,29 @@ check("countLineDiff: prefix/suffix trim keeps LCS small", () => {
   const oldText = [...head, "MID", ...tail].join("\n");
   const newText = [...head, "NEW", ...tail].join("\n");
   assert.deepEqual(countLineDiff(oldText, newText), { added: 1, removed: 1 });
+});
+
+// -------------------------------------------------- countEditsLineDiff ----
+check("countEditsLineDiff: sums over the edits array", () => {
+  const stat = countEditsLineDiff({
+    edits: [
+      { oldText: "a\nb\nc", newText: "a\nX\nc" }, // +1 -1
+      { oldText: "tail", newText: "tail\nextra" }, // +1 -0
+    ],
+  });
+  assert.deepEqual(stat, { added: 2, removed: 1 });
+});
+check("countEditsLineDiff: legacy single oldText/newText shape", () => {
+  assert.deepEqual(countEditsLineDiff({ oldText: "x", newText: "y\nz" }), { added: 2, removed: 1 });
+});
+check("countEditsLineDiff: garbage input yields undefined", () => {
+  assert.equal(countEditsLineDiff(undefined), undefined);
+  assert.equal(countEditsLineDiff({}), undefined);
+  assert.equal(countEditsLineDiff({ edits: "nope" }), undefined);
+  assert.equal(countEditsLineDiff({ edits: [{ oldText: 5 }] }), undefined);
+});
+check("countEditsLineDiff: new-content-only edit counts as additions", () => {
+  assert.deepEqual(countEditsLineDiff({ edits: [{ newText: "a\nb" }] }), { added: 2, removed: 0 });
 });
 
 // -------------------------------------------------- thinking line renderers ----

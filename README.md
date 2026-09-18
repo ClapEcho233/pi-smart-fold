@@ -29,11 +29,14 @@
 
 每次 `session_start`（启动 / `/reload` / `/new` / `/resume` / `/fork`）自动调用 `ctx.ui.setToolsExpanded(false)`，工具输出保持折叠，`ctrl+o` 手动展开。
 
-### 3. Write 增删统计 + 完全折叠
+### 3. 工具调用行截断 + Write/Edit 增删统计
 
-- write 工具执行**前**读取原文件内容，与写入内容做行级 diff（公共前后缀裁剪 + LCS），在 `write <path>` 首行后追加 **绿色 `+新增` / 红色 `-删除`** 行数，如 `write src/index.ts +12 -3`；新文件显示 `+N -0`。
-- 折叠的 write 行**只显示首行**（完全折叠），点击 / `ctrl+o` 展开后才显示带语法高亮的内容预览。
-- 实现方式为对 pi 内置 write 工具的渲染包装（执行逻辑完全复用 `createWriteToolDefinition`），超大文件（>8MB）跳过统计。
+- **调用命令过长时截断**：`bash`/`read`/`grep`/`find`/`ls` 等工具的调用行在折叠状态下截断为单行，超宽时以 `…` 结尾（pi 自带的 ANSI 感知 `truncateToWidth`），命令还有后续行时追加 ` …` 标记；点击或 `ctrl+o` 展开后与工具输出一起完整显示。
+- **write / edit 增删统计**：
+  - write：执行**前**读取原文件内容，与写入内容做行级 diff（公共前后缀裁剪 + LCS），首行追加 **绿色 `+新增` / 红色 `-删除`**，如 `write src/index.ts +12 -3`；新文件 `+N -0`；超大文件（>8MB）跳过。
+  - edit：直接对各 `edits` 的 `oldText → newText` 做行级 diff 并求和，如 `edit src/app.ts +2 -1`（参数流式传输时就实时更新）。
+- 折叠的 write/edit 行**只显示首行**（`writeCollapsed: header`，可在设置中改回 `preview` 保留 pi 原生预览），展开后显示完整内容 / 差异。
+- 实现方式为对 pi 内置工具的渲染包装（执行逻辑完全复用各 `create*ToolDefinition`）。
 
 ## 设置界面
 

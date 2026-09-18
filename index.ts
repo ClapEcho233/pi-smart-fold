@@ -56,13 +56,20 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   AssistantMessageComponent,
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createLsToolDefinition,
+  createReadToolDefinition,
   createWriteToolDefinition,
   getSettingsListTheme,
 } from "@earendil-works/pi-coding-agent";
-import { Container, SettingsList, Text } from "@earendil-works/pi-tui";
+import { Container, SettingsList, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Component, SettingItem } from "@earendil-works/pi-tui";
 
 import {
+  countEditsLineDiff,
   countLineDiff,
   displayWidth,
   expandedThinkingSuffix,
@@ -295,6 +302,25 @@ interface CtxLike {
 const MAX_WRITE_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_REVEALED_BLOCKS = 2000;
 
+/** Index of the first line with visible content (padding/blank lines skipped). */
+function firstContentLine(lines: string[]): number {
+  const plain = (line: string): string =>
+    line
+      .replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "")
+      .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g, "");
+  for (let i = 0; i < lines.length; i++) {
+    if (plain(lines[i]).trim() !== "") return i;
+  }
+  return 0;
+}
+
+/** Drop trailing filler padding (Box pads lines to the full width). */
+function trimLineFiller(line: string): string {
+  return line
+    .replace(/[ \t]+(\u001b\[[0-9;]*[A-Za-z])$/, "$1")
+    .replace(/[ \t]+$/, "");
+}
+
 export default function smartFold(pi: ExtensionAPI): void {
   const extensionDir = resolveExtensionDir();
   const config: SmartFoldConfig = extensionDir
@@ -352,7 +378,7 @@ export default function smartFold(pi: ExtensionAPI): void {
   const writeStats = new Map<string, { added: number; removed: number }>();
 
   /** Live write call rows, so a stat computed after render can force a rerender. */
-  const writeRows = new Map<string, WriteCallWrapper>();
+  const writeRows = new Map<string, ToolCallWrapper>();
 
   // -------------------------------------------------------------------------
   // 1) Thinking: live tail while streaming, folded line with duration after,
@@ -472,14 +498,22 @@ export default function smartFold(pi: ExtensionAPI): void {
   });
 
   // -------------------------------------------------------------------------
-  // 3) write tool: `+N -M` diff stats + fully collapsed rows.
+  // 3) Tool calls: collapsed lines truncated with an ellipsis; write/edit
+  //    headers gain git-style `+N -M` stats.
   // -------------------------------------------------------------------------
-  class WriteCallWrapper implements Component {
+  class ToolCallWrapper implements Component {
     inner: Component;
     readonly toolCallId: string;
+    args: unknown;
     expanded = false;
     theme: ThemeLike | undefined;
     invalidateRef: (() => void) | undefined;
+    /** Collapsed style: header-only (write/edit) vs truncated first line. */
+    headerOnly = false;
+    /** Stats computed straight from the call args (edit). */
+    statFromArgs: ((args: unknown) => { added: number; removed: number } | undefined) | undefined;
+    /** Stats computed from the pre-execution file snapshot (write). */
+    statFromMap = false;
 
     constructor(toolCallId: string, inner: Component) {
       this.toolCallId = toolCallId;
@@ -493,55 +527,112 @@ export default function smartFold(pi: ExtensionAPI): void {
     render(width: number): string[] {
       const lines = this.inner.render(width);
       if (lines.length === 0) return lines;
-      const collapsed = !this.expanded;
-      const out =
-        collapsed && config.writeCollapsed === "header" ? [lines[0]] : lines.slice();
-      const stat = config.writeStat ? writeStats.get(this.toolCallId) : undefined;
-      if (stat && this.theme) {
-        const suffix =
-          ` ${this.theme.fg("success", `+${stat.added}`)}` +
-          ` ${this.theme.fg("error", `-${stat.removed}`)}`;
-        if (displayWidth(lines[0]) + displayWidth(suffix) <= width) {
-          out[0] = lines[0] + suffix;
-        } else {
-          out.splice(1, 0, suffix.trim());
+      if (this.expanded) return lines.slice(); // expanded: everything, untruncated
+
+      const stat = config.writeStat
+        ? this.statFromMap
+          ? writeStats.get(this.toolCallId)
+          : this.statFromArgs?.(this.args)
+        : undefined;
+      const suffix =
+        stat && this.theme
+          ? ` ${this.theme.fg("success", `+${stat.added}`)}` +
+            ` ${this.theme.fg("error", `-${stat.removed}`)}`
+          : "";
+
+      if (this.headerOnly && config.writeCollapsed === "header") {
+        const headerIndex = firstContentLine(lines);
+        const header = suffix ? trimLineFiller(lines[headerIndex]) : lines[headerIndex];
+        const out = [header];
+        if (suffix) {
+          if (displayWidth(header) + displayWidth(suffix) <= width) {
+            out[0] = header + suffix;
+          } else {
+            out.splice(1, 0, suffix.trim());
+          }
         }
+        return out;
       }
-      return out;
+
+      // Collapsed: single first content line, truncated to the terminal width
+      // with an ellipsis (an extra `…` marks hidden continuation lines).
+      const headerIndex = firstContentLine(lines);
+      let line = trimLineFiller(lines[headerIndex]);
+      if (suffix) line += suffix;
+      if (lines.length > headerIndex + 1) line += " …";
+      return [truncateToWidth(line, width, "…")];
     }
   }
 
-  // pi's own write tool implementation — only the rendering is wrapped.
-  const baseWrite = createWriteToolDefinition(process.cwd());
-
-  pi.registerTool({
-    ...baseWrite,
-    renderCall(
+  /**
+   * Build a renderCall that delegates to pi's own renderer and wraps its
+   * component in our ToolCallWrapper. Only the TUI rendering is customized;
+   * execution stays pi's own implementation.
+   */
+  const wrapToolRenderCall = (
+    base: { renderCall?: unknown } & Record<string, unknown>,
+    opts: {
+      headerOnly?: boolean;
+      statFromArgs?: (args: unknown) => { added: number; removed: number } | undefined;
+      statFromMap?: boolean;
+    } = {},
+  ) => {
+    const baseRenderCall = base.renderCall as (
       args: unknown,
       theme: ThemeLike,
       context: ToolRenderContextLike,
-    ): Component {
+    ) => Component;
+    return (args: unknown, theme: ThemeLike, context: ToolRenderContextLike): Component => {
       let wrapper =
-        context.lastComponent instanceof WriteCallWrapper
-          ? (context.lastComponent as WriteCallWrapper)
+        context.lastComponent instanceof ToolCallWrapper
+          ? (context.lastComponent as ToolCallWrapper)
           : undefined;
-      const inner = (baseWrite.renderCall as (
-        a: unknown,
-        t: ThemeLike,
-        c: ToolRenderContextLike,
-      ) => Component)(args, theme, { ...context, lastComponent: wrapper?.inner });
+      const inner = baseRenderCall(args, theme, {
+        ...context,
+        lastComponent: wrapper?.inner,
+      });
       if (!wrapper) {
-        wrapper = new WriteCallWrapper(String(context.toolCallId ?? ""), inner);
+        wrapper = new ToolCallWrapper(String(context.toolCallId ?? ""), inner);
+        wrapper.headerOnly = Boolean(opts.headerOnly);
+        wrapper.statFromArgs = opts.statFromArgs;
+        wrapper.statFromMap = Boolean(opts.statFromMap);
       } else {
         wrapper.inner = inner;
       }
+      wrapper.args = args;
       wrapper.theme = theme;
       wrapper.expanded = Boolean(context.expanded);
       wrapper.invalidateRef = context.invalidate;
-      if (wrapper.toolCallId) writeRows.set(wrapper.toolCallId, wrapper);
+      if (wrapper.statFromMap && wrapper.toolCallId) {
+        writeRows.set(wrapper.toolCallId, wrapper);
+      }
       return wrapper;
-    },
-  });
+    };
+  };
+
+  // Register the overrides: shell/file tools get collapsed-line truncation;
+  // write/edit additionally get `+N -M` stats and header-only collapse.
+  const toolOverrides: Array<[Record<string, unknown>, Parameters<typeof wrapToolRenderCall>[1]]> = [
+    [createBashToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
+    [createReadToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
+    [createGrepToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
+    [createFindToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
+    [createLsToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
+    [
+      createEditToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
+      { headerOnly: true, statFromArgs: countEditsLineDiff },
+    ],
+    [
+      createWriteToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
+      { headerOnly: true, statFromMap: true },
+    ],
+  ];
+  for (const [baseTool, opts] of toolOverrides) {
+    pi.registerTool({
+      ...(baseTool as object),
+      renderCall: wrapToolRenderCall(baseTool, opts),
+    } as never);
+  }
 
   // Read the previous file content right before the write executes, so the
   // header can show a git-style `+N -M` stat.
@@ -624,9 +715,9 @@ export default function smartFold(pi: ExtensionAPI): void {
   const statusLine = (): string =>
     `smart-fold — thinking: ${config.thinking} · 全部展开: ${
       expandAllThinking ? "开" : "关"
-    } · 工具输出: ${config.toolsFold ? "启动时折叠" : "启动时展开"} · write统计: ${
+    } · 工具输出: ${config.toolsFold ? "启动时折叠" : "启动时展开"} · write/edit统计: ${
       config.writeStat ? "开" : "关"
-    } · write折叠: ${config.writeCollapsed === "header" ? "仅首行" : "保留预览"}`;
+    } · write/edit折叠: ${config.writeCollapsed === "header" ? "仅首行" : "保留预览"}`;
 
   const openSettings = async (ctx: CtxLike & {
     ui: CtxLike["ui"] & {
@@ -666,17 +757,18 @@ export default function smartFold(pi: ExtensionAPI): void {
         },
         {
           id: "writeStat",
-          label: "Write 增删统计",
+          label: "Write/Edit 增删统计",
           currentValue: config.writeStat ? "on" : "off",
           values: ["on", "off"],
-          description: "write 首行追加绿色 +新增 / 红色 -删除 行数（与写入前内容对比）",
+          description:
+            "write/edit 首行追加绿色 +新增 / 红色 -删除 行数（write 与写入前文件对比，edit 与原文片段对比）",
         },
         {
           id: "writeCollapsed",
-          label: "Write 折叠样式",
+          label: "Write/Edit 折叠样式",
           currentValue: config.writeCollapsed,
           values: ["header", "preview"],
-          description: "header: 折叠时只显示首行；preview: 保留内容预览（pi 默认）",
+          description: "header: 折叠时只显示首行；preview: 保留内容/差异预览（pi 默认）",
         },
       ];
 
@@ -787,13 +879,13 @@ export default function smartFold(pi: ExtensionAPI): void {
         return;
       }
 
-      if (target === "writestat" || target === "write-stat") {
+      if (target === "writestat" || target === "write-stat" || target === "editstat") {
         if (value !== "on" && value !== "off") {
           ctx.ui.notify("用法: /fold writestat on|off", "warning");
           return;
         }
         applyWriteStat(value === "on");
-        ctx.ui.notify(`write 增删统计: ${value === "on" ? "开" : "关"} — 已保存`, "info");
+        ctx.ui.notify(`write/edit 增删统计: ${value === "on" ? "开" : "关"} — 已保存`, "info");
         return;
       }
 

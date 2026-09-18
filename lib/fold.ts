@@ -251,6 +251,36 @@ export function countLineDiff(
   return { added: b.length - common, removed: a.length - common };
 }
 
+/**
+ * Line-level added/removed counts summed over an edit tool's edits array
+ * (supports the legacy single oldText/newText shape). Returns undefined when
+ * there is nothing renderable.
+ */
+export function countEditsLineDiff(
+  input: { edits?: unknown; oldText?: unknown; newText?: unknown } | undefined,
+): LineDiffStat | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const edits = Array.isArray(input.edits)
+    ? input.edits
+    : typeof input.oldText === "string" && typeof input.newText === "string"
+      ? [{ oldText: input.oldText, newText: input.newText }]
+      : [];
+  let added = 0;
+  let removed = 0;
+  let seen = false;
+  for (const edit of edits as Array<{ oldText?: unknown; newText?: unknown }>) {
+    if (!edit || typeof edit !== "object") continue;
+    const oldText = typeof edit.oldText === "string" ? edit.oldText : undefined;
+    const newText = typeof edit.newText === "string" ? edit.newText : undefined;
+    if (oldText === undefined && newText === undefined) continue;
+    const stat = countLineDiff(oldText, newText ?? "");
+    added += stat.added;
+    removed += stat.removed;
+    seen = true;
+  }
+  return seen ? { added, removed } : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Thinking line renderers (display-only, used by the markdown transformer)
 // ---------------------------------------------------------------------------
