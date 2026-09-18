@@ -1,0 +1,18 @@
+{
+  "name": "pi-smart-fold",
+  "version": "0.1.0",
+  "description": "pi coding-agent extension: collapse tool output at startup and fold thinking blocks to a live last line",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi", "pi-extension", "pi-package"],
+  "main": "index.ts",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "node test/fold.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
