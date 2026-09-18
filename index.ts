@@ -682,9 +682,42 @@ export default function smartFold(pi: ExtensionAPI): void {
     };
   };
 
+  /**
+   * Build a renderResult wrapper for tools whose result area shows code
+   * details (edit renders its full diff). Collapsed + header mode shows
+   * nothing (errors stay visible); expanded delegates to pi's renderer.
+   */
+  const wrapToolRenderResult = (
+    base: { renderResult?: unknown } & Record<string, unknown>,
+  ) => {
+    const baseRenderResult = base.renderResult as (
+      result: unknown,
+      options: { expanded?: boolean },
+      theme: ThemeLike,
+      context: ToolRenderContextLike & { isError?: boolean },
+    ) => Component;
+    if (typeof baseRenderResult !== "function") return undefined;
+    return (
+      result: unknown,
+      options: { expanded?: boolean },
+      theme: ThemeLike,
+      context: ToolRenderContextLike & { isError?: boolean },
+    ): Component => {
+      if (!options.expanded && config.writeCollapsed === "header" && !context.isError) {
+        // Fully collapsed: no code/diff details at all in the result area.
+        return new Container();
+      }
+      return baseRenderResult(result, options, theme, context);
+    };
+  };
+
   // Register the overrides: shell/file tools get collapsed-line truncation;
-  // write/edit additionally get `+N -M` stats and header-only collapse.
-  const toolOverrides: Array<[Record<string, unknown>, Parameters<typeof wrapToolRenderCall>[1]]> = [
+  // write/edit additionally get `+N -M` stats, header-only collapse and a
+  // detail-free collapsed result area.
+  const toolOverrides: Array<[
+    Record<string, unknown>,
+    Parameters<typeof wrapToolRenderCall>[1] & { hideCollapsedResult?: boolean },
+  ]> = [
     [createBashToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
     [createReadToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
     [createGrepToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
@@ -692,17 +725,20 @@ export default function smartFold(pi: ExtensionAPI): void {
     [createLsToolDefinition(process.cwd()) as unknown as Record<string, unknown>, {}],
     [
       createEditToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
-      { headerOnly: true, statFromArgs: countEditsLineDiff },
+      { headerOnly: true, statFromArgs: countEditsLineDiff, hideCollapsedResult: true },
     ],
     [
       createWriteToolDefinition(process.cwd()) as unknown as Record<string, unknown>,
-      { headerOnly: true, statFromMap: true },
+      { headerOnly: true, statFromMap: true, hideCollapsedResult: true },
     ],
   ];
   for (const [baseTool, opts] of toolOverrides) {
     pi.registerTool({
       ...(baseTool as object),
       renderCall: wrapToolRenderCall(baseTool, opts),
+      ...(opts.hideCollapsedResult
+        ? { renderResult: wrapToolRenderResult(baseTool) }
+        : {}),
     } as never);
   }
 
