@@ -9,12 +9,20 @@
  *        label line, then the scrolling tail of the thinking text below it.
  *      - Once the message finishes, the block collapses to a single bold
  *        `Thought for 12.4s` line.
- *      - Expansion is driven by ONE reliable switch: the `alt+t` shortcut
- *        (and /fold expand) toggles every finished thinking block between
- *        collapsed and full text (with the duration footer at the bottom).
- *        Clicking a collapsed block only toggles pi's internal hidden state;
- *        the extension owns that state's label text, so the native
- *        "Thinking..." never appears — it shows our own hint instead.
+ *      - Click a collapsed block, then click again — that single block
+ *        expands to its full text (with the duration footer at the bottom);
+ *        the same two-click gesture collapses it again. The first click only
+ *        flips pi's internal hidden state (our hint label shows briefly);
+ *        the second click re-renders the block, which is when the extension
+ *        toggles it.
+ *      - Click detection is exact, not heuristic: pi's click handler mutates
+ *        the component's internal `thinkingVisibilityOverrides` map before
+ *        re-rendering. The extension observes that mutation through a small
+ *        idempotent prototype patch on the (publicly exported)
+ *        AssistantMessageComponent, so global re-renders (theme change,
+ *        resize, ctrl+t) never fake a click.
+ *      - The extension owns pi's hidden-thinking label text, so the native
+ *        "Thinking..." never appears — clicks and ctrl+t show our hint.
  *      - Durations are measured per thinking run and persisted in the
  *        session, so restored sessions keep showing them.
  *   2. Tool output is collapsed on every session start (`session_start`
@@ -31,10 +39,9 @@
  * rendering is customized.
  *
  * Runtime control:
- *   alt+t                          expand / collapse all finished thinking
  *   /fold                          open the /config-style settings list
  *   /fold thinking smart|tail|full|off
- *   /fold expand on|off
+ *   /fold expand on|off            expand-all fallback (per-block clicks are primary)
  *   /fold tools on|off
  *   /fold writestat on|off
  *   /fold writecollapsed header|preview
@@ -47,7 +54,11 @@ import { dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createWriteToolDefinition, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import {
+  AssistantMessageComponent,
+  createWriteToolDefinition,
+  getSettingsListTheme,
+} from "@earendil-works/pi-coding-agent";
 import { Container, SettingsList, Text } from "@earendil-works/pi-tui";
 import type { Component, SettingItem } from "@earendil-works/pi-tui";
 
@@ -89,6 +100,161 @@ function resolveExtensionDir(): string | undefined {
   return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Click observation (exact, not heuristic)
+// ---------------------------------------------------------------------------
+//
+// pi's click handler on a thinking block does:
+//     this.thinkingVisibilityOverrides.set(runIndex, !hidden);
+//     this.updateContent(this.lastMessage);
+// and ctrl+t / the settings toggle do:
+//     this.thinkingVisibilityOverrides.clear();
+//     this.updateContent(...)
+//
+// We patch AssistantMessageComponent.prototype.updateContent (idempotently,
+// shared across extension reloads via Symbol.for keys) to diff that map
+// against a per-component snapshot. A set-style change (click) records a
+// global timestamp; clears are ignored. The markdown transformer then knows
+// a render was click-triggered — no thresholds, no counting, no forced
+// re-renders.
+
+const LAST_TOGGLE = Symbol.for("pi-smart-fold.lastToggleAt");
+const TOGGLE_SEQ = Symbol.for("pi-smart-fold.toggleSeq");
+const CLICKED_HASH = Symbol.for("pi-smart-fold.clickedHash");
+const OVERRIDE_SNAPSHOT = Symbol.for("pi-smart-fold.overrideSnapshot");
+type ToggleGlobal = typeof globalThis & {
+  [LAST_TOGGLE]?: number;
+  [TOGGLE_SEQ]?: number;
+  [CLICKED_HASH]?: string;
+};
+
+/** How long after a click its re-render is expected (generous for slow frames). */
+const TOGGLE_WINDOW_MS = 250;
+
+function sameOverrideEntries(
+  a: Array<[number, boolean]>,
+  b: Array<[number, boolean]>,
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i][0] !== b[i][0] || a[i][1] !== b[i][1]) return false;
+  }
+  return true;
+}
+
+/** The run index whose override entry changed between snapshots (or null). */
+function firstChangedRun(
+  previous: Array<[number, boolean]>,
+  current: Array<[number, boolean]>,
+): number | null {
+  const currentMap = new Map(current);
+  for (const [run, value] of previous) {
+    if (currentMap.get(run) !== value) return run; // value flipped
+  }
+  for (const [run] of current) {
+    if (!previous.some(([pRun]) => pRun === run)) return run; // newly added
+  }
+  return null;
+}
+
+function installThinkingClickObserver(): void {
+  const proto = (
+    AssistantMessageComponent as unknown as {
+      prototype?: { updateContent?: (...args: unknown[]) => unknown };
+    }
+  ).prototype;
+  const original = proto?.updateContent;
+  if (typeof original !== "function") return;
+  if ("__smartFoldPatched" in original) return; // already installed by a previous load
+  try {
+    const patched = function (this: unknown, message: unknown, isStreaming?: boolean) {
+      const self = this as {
+        thinkingVisibilityOverrides?: Map<number, boolean>;
+        [key: symbol]: Array<[number, boolean]> | undefined;
+      };
+      try {
+        const overrides = self.thinkingVisibilityOverrides;
+        if (overrides instanceof Map) {
+          const previous = self[OVERRIDE_SNAPSHOT];
+          const current = Array.from(overrides.entries());
+          if (
+            previous !== undefined &&
+            previous.length + current.length > 0 &&
+            !(current.length === 0 && previous.length > 0) && // clear = ctrl+t/settings
+            !sameOverrideEntries(previous, current)
+          ) {
+            const toggleGlobal = globalThis as ToggleGlobal;
+            // Which run was toggled? (a click changes exactly one entry)
+            const changedRun = firstChangedRun(previous, current);
+            const runText =
+              changedRun === null
+                ? null
+                : thinkingRunText((self as { lastMessage?: unknown }).lastMessage, changedRun);
+            toggleGlobal[LAST_TOGGLE] = Date.now();
+            toggleGlobal[TOGGLE_SEQ] = (toggleGlobal[TOGGLE_SEQ] ?? 0) + 1;
+            if (runText !== null) toggleGlobal[CLICKED_HASH] = hashText(runText);
+          }
+          self[OVERRIDE_SNAPSHOT] = current;
+        }
+      } catch {
+        // Observation is best-effort.
+      }
+      return (original as (this: unknown, m: unknown, s?: boolean) => unknown).call(
+        this,
+        message,
+        isStreaming,
+      );
+    };
+    Object.defineProperty(patched, "__smartFoldPatched", { value: true });
+    proto.updateContent = patched as typeof original;
+  } catch {
+    // Best-effort: without the patch, clicks simply won't expand.
+  }
+}
+
+/**
+ * Joined text of the `wantedRunIndex`-th thinking run of a message — mirrors
+ * exactly how pi's AssistantMessageComponent groups consecutive thinking
+ * blocks into runs (blocks trimmed, non-empty only, joined with a blank line).
+ */
+function thinkingRunText(message: unknown, wantedRunIndex: number): string | null {
+  const content = (message as { content?: Array<{ type?: string; thinking?: string }> })
+    ?.content;
+  if (!Array.isArray(content)) return null;
+  let runIndex = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content[i]?.type !== "thinking") continue;
+    const blocks: string[] = [];
+    for (; i < content.length; i++) {
+      const block = content[i];
+      if (block?.type !== "thinking") break;
+      const text = typeof block.thinking === "string" ? block.thinking.trim() : "";
+      if (text) blocks.push(text);
+    }
+    i--;
+    if (runIndex++ === wantedRunIndex) {
+      return blocks.length > 0 ? blocks.join("\n\n") : null;
+    }
+  }
+  return null;
+}
+
+/** Monotonic id of the last observed thinking-click (0 = none). */
+function lastClickSeq(): number {
+  return (globalThis as ToggleGlobal)[TOGGLE_SEQ] ?? 0;
+}
+
+/** Info about the most recent thinking-click, if it identified a block. */
+function lastClickInfo(): { seq: number; at: number; hash: string | undefined } | undefined {
+  const toggleGlobal = globalThis as ToggleGlobal;
+  if (toggleGlobal[TOGGLE_SEQ] === undefined) return undefined;
+  return {
+    seq: toggleGlobal[TOGGLE_SEQ]!,
+    at: toggleGlobal[LAST_TOGGLE] ?? 0,
+    hash: toggleGlobal[CLICKED_HASH],
+  };
+}
+
 /** Renderer-facing theme subset (avoids coupling to the full Theme type). */
 interface ThemeLike {
   fg(color: string, text: string): string;
@@ -127,8 +293,7 @@ interface CtxLike {
 }
 
 const MAX_WRITE_FILE_BYTES = 8 * 1024 * 1024;
-/** Shortcut that toggles all finished thinking blocks (collapsed ↔ full). */
-const EXPAND_SHORTCUT = "alt+t";
+const MAX_REVEALED_BLOCKS = 2000;
 
 export default function smartFold(pi: ExtensionAPI): void {
   const extensionDir = resolveExtensionDir();
@@ -140,28 +305,37 @@ export default function smartFold(pi: ExtensionAPI): void {
     if (extensionDir) saveConfig(extensionDir, config);
   };
 
+  installThinkingClickObserver();
+
   // Runtime state -----------------------------------------------------------
 
   /** Thinking-run timing (live elapsed + finalized durations by content hash). */
   const tracker = new ThinkingTracker();
 
   /**
-   * Runtime switch for the alt+t toggle: when true, every finished thinking
-   * block renders its full text (with duration footer) instead of the folded
-   * `Thought for …` line. Deliberately not persisted — sessions start compact.
+   * Content hashes of finished thinking blocks the user expanded by clicking.
+   * Toggled exactly once per observed click, so stray/global re-renders are
+   * inert and resize keeps user intent.
+   */
+  const revealedBlocks = new Set<string>();
+  /** Clicks already applied per block (one toggle per click event). */
+  const appliedClicks = new Map<string, number>();
+
+  /**
+   * Expand-all fallback (settings item / /fold expand). Per-block clicks are
+   * the primary interaction; this covers "show me everything" and works even
+   * if the click observer could not be installed.
    */
   let expandAllThinking = false;
 
   /**
-   * Text shown by pi's internal hidden-thinking state. We own it so the
-   * native "Thinking..." label never appears anywhere (click toggles and the
-   * built-in ctrl+t alike show our hint instead).
+   * Text shown by pi's internal hidden-thinking state (first click of the
+   * two-click gesture, and ctrl+t). We own it so the native "Thinking..."
+   * never appears anywhere.
    */
   const hiddenThinkingLabelText = (): string | undefined => {
     if (config.thinking === "off") return undefined; // restore pi's default
-    return expandAllThinking
-      ? `Thought… · 按 ${EXPAND_SHORTCUT} 折叠全部思考`
-      : `Thought… · 按 ${EXPAND_SHORTCUT} 展开全部思考`;
+    return "Thought… · 再次点击展开 / 收起";
   };
 
   /** Apply (or restore) the hidden-thinking label; re-renders all messages. */
@@ -181,7 +355,8 @@ export default function smartFold(pi: ExtensionAPI): void {
   const writeRows = new Map<string, WriteCallWrapper>();
 
   // -------------------------------------------------------------------------
-  // 1) Thinking: live tail while streaming, folded line with duration after.
+  // 1) Thinking: live tail while streaming, folded line with duration after,
+  //    per-block click expansion.
   // -------------------------------------------------------------------------
   pi.registerMarkdownTransformer((markdown, context) => {
     if (context.messageType !== "assistant-thinking") return markdown;
@@ -204,7 +379,25 @@ export default function smartFold(pi: ExtensionAPI): void {
     let ms = tracker.finalizedMs(key);
     if (ms === undefined) ms = tracker.finalizeIfMatches(markdown);
 
-    if (mode === "full" || expandAllThinking) {
+    // A click on this block re-renders it shortly after the click handler
+    // mutated that block's visibility override. The observer recorded exactly
+    // which block (by content hash) was clicked — toggle only that one, and
+    // only once per click event (the sequence id stays unique even for
+    // clicks within the same millisecond).
+    const click = lastClickInfo();
+    if (
+      click &&
+      Date.now() - click.at <= TOGGLE_WINDOW_MS &&
+      click.hash === key &&
+      appliedClicks.get(key) !== click.seq
+    ) {
+      appliedClicks.set(key, click.seq);
+      if (revealedBlocks.has(key)) revealedBlocks.delete(key);
+      else revealedBlocks.add(key);
+      if (revealedBlocks.size > MAX_REVEALED_BLOCKS) revealedBlocks.clear();
+    }
+
+    if (mode === "full" || expandAllThinking || revealedBlocks.has(key)) {
       // Fully expanded: original text, with the duration footer at the bottom.
       return markdown.replace(/\s+$/, "") + expandedThinkingSuffix(ms);
     }
@@ -261,7 +454,9 @@ export default function smartFold(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const scoped = ctx as unknown as CtxLike;
     restoreFromBranch(scoped);
-    expandAllThinking = false; // sessions start compact
+    revealedBlocks.clear(); // sessions start compact
+    appliedClicks.clear();
+    expandAllThinking = false;
     applyHiddenLabel(scoped);
     if (!config.toolsFold) return;
     if (!ctx.hasUI) return; // no-op guard for print / json modes
@@ -391,28 +586,17 @@ export default function smartFold(pi: ExtensionAPI): void {
   });
 
   // -------------------------------------------------------------------------
-  // 4) alt+t — expand / collapse all finished thinking blocks.
-  // -------------------------------------------------------------------------
-  const applyExpandAll = (on: boolean, ctx: CtxLike): void => {
-    if (expandAllThinking === on) return;
-    expandAllThinking = on;
-    applyHiddenLabel(ctx); // also re-renders every message through the transformer
-  };
-
-  pi.registerShortcut(EXPAND_SHORTCUT, {
-    description: "smart-fold: 展开/折叠全部已完成的思考",
-    handler: async (ctx) => {
-      applyExpandAll(!expandAllThinking, ctx as unknown as CtxLike);
-    },
-  });
-
-  // -------------------------------------------------------------------------
-  // 5) /fold — /config-style settings list.
+  // 4) /fold — /config-style settings list.
   // -------------------------------------------------------------------------
   const applyThinking = (mode: ThinkingMode, ctx: CtxLike): void => {
     config.thinking = mode;
     persist();
     applyHiddenLabel(ctx);
+  };
+
+  const applyExpandAll = (on: boolean, ctx: CtxLike): void => {
+    expandAllThinking = on;
+    applyHiddenLabel(ctx); // re-renders every message through the transformer
   };
 
   const applyToolsFold = (on: boolean, ctx: CtxLike): void => {
@@ -438,7 +622,7 @@ export default function smartFold(pi: ExtensionAPI): void {
   };
 
   const statusLine = (): string =>
-    `smart-fold — thinking: ${config.thinking} · 思考展开: ${
+    `smart-fold — thinking: ${config.thinking} · 全部展开: ${
       expandAllThinking ? "开" : "关"
     } · 工具输出: ${config.toolsFold ? "启动时折叠" : "启动时展开"} · write统计: ${
       config.writeStat ? "开" : "关"
@@ -464,14 +648,14 @@ export default function smartFold(pi: ExtensionAPI): void {
           currentValue: config.thinking,
           values: ["smart", "tail", "full", "off"],
           description:
-            "smart: 思考中显示 Thinking…(时长)+滚动结尾；结束后折叠为 Thought for 时长",
+            "smart: 思考中显示 Thinking…(时长)+滚动结尾；结束后折叠为 Thought for 时长；点击两次展开/收起单块",
         },
         {
           id: "expand",
           label: "展开全部思考",
           currentValue: expandAllThinking ? "on" : "off",
           values: ["on", "off"],
-          description: `等同于 ${EXPAND_SHORTCUT} 快捷键：临时展开/折叠全部已完成的思考（不持久化）`,
+          description: "临时展开/折叠全部已完成的思考（备用；日常用点击单块展开，不持久化）",
         },
         {
           id: "tools",
@@ -582,7 +766,7 @@ export default function smartFold(pi: ExtensionAPI): void {
 
       if (target === "expand") {
         if (value !== "on" && value !== "off") {
-          ctx.ui.notify(`用法: /fold expand on|off（或按 ${EXPAND_SHORTCUT}）`, "warning");
+          ctx.ui.notify("用法: /fold expand on|off（备用；日常点击思考块两次展开/收起）", "warning");
           return;
         }
         applyExpandAll(value === "on", scoped);
