@@ -105,6 +105,28 @@ export function lastNonEmptyLine(markdown: string): string {
   return "";
 }
 
+/** A markdown code-fence line: up to 3 spaces indent, then ``` or ~~~. */
+const FENCE_LINE = /^\s{0,3}(?:`{3,}|~{3,})/;
+
+/**
+ * Last line of a markdown string worth showing as a one-line tail: blank
+ * lines and structural code-fence lines are skipped, and lines that strip
+ * down to nothing (bare block markers) are skipped too. Returns "" when
+ * there is no such line — e.g. while the model is right at a code fence
+ * being streamed.
+ */
+export function lastMeaningfulLine(markdown: string): string {
+  const lines = markdown.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const raw = lines[i];
+    if (raw.trim() === "") continue;
+    if (FENCE_LINE.test(raw)) continue; // opening/closing fence — structural
+    const stripped = stripBlockMarkers(raw);
+    if (stripped !== "") return stripped;
+  }
+  return "";
+}
+
 /**
  * Strip common block-level markdown markers (`#`, `>`, `-`, `*`, `1.`)
  * so the collapsed line reads like prose. Runs a few passes for nesting
@@ -128,12 +150,13 @@ export function stripBlockMarkers(raw: string): string {
 
 /**
  * Collapse a thinking markdown block into a single line:
- * take its last non-empty line, strip block markers, and tail-truncate
+ * take its last meaningful line, strip block markers, and tail-truncate
  * to `availableWidth` display columns. Falls back to the original
  * markdown when there is nothing to show.
  */
 export function collapseThinking(markdown: string, availableWidth: number): string {
-  const line = stripBlockMarkers(lastNonEmptyLine(markdown));
+  if (lastNonEmptyLine(markdown) === "") return markdown; // nothing visible
+  const line = lastMeaningfulLine(markdown);
   if (!line) return markdown;
   return tailFit(line, sanitizeWidth(availableWidth));
 }
@@ -298,8 +321,16 @@ export function liveThinkingLine(
   elapsedMs: number | undefined,
   width: number,
 ): string {
-  const tail = stripBlockMarkers(lastNonEmptyLine(markdown));
-  if (!tail) return markdown;
+  if (lastNonEmptyLine(markdown) === "") return markdown; // nothing visible
+  const tail = lastMeaningfulLine(markdown);
+  if (!tail) {
+    // Only structural lines so far (e.g. a bare code fence being streamed):
+    // show the label alone — falling back to the full text would flash the
+    // whole block open for a frame (the fold "flicker").
+    return elapsedMs === undefined
+      ? ""
+      : `**Thinking… (${formatDuration(elapsedMs, "live")})**`;
+  }
   const fitted = tailFit(tail, sanitizeWidth(width));
   if (elapsedMs === undefined) return fitted;
   return `**Thinking… (${formatDuration(elapsedMs, "live")})**\n\n${fitted}`;
@@ -318,8 +349,15 @@ export function foldedThinkingLine(
 ): string {
   const w = sanitizeWidth(width);
   if (style === "tail") {
-    const tail = stripBlockMarkers(lastNonEmptyLine(markdown));
-    if (!tail) return markdown;
+    if (lastNonEmptyLine(markdown) === "") return markdown; // nothing visible
+    const tail = lastMeaningfulLine(markdown);
+    if (!tail) {
+      // Nothing textual (e.g. thinking ends right at a code fence): the
+      // duration line alone — never fall back to the full markdown.
+      return ms === undefined
+        ? "**Thought…**"
+        : `**Thought for ${formatDuration(ms, "final")}**`;
+    }
     const prefix = ms === undefined ? "" : `**${formatDuration(ms, "final")}** · `;
     return tailFit(prefix + tail, w);
   }
@@ -345,5 +383,30 @@ export function liveExpandedSuffix(ms: number | undefined): string {
  */
 export function expandedThinkingSuffix(ms: number | undefined): string {
   return ms === undefined ? "" : `\n\n**Thought for ${formatDuration(ms, "final")}**`;
+}
+
+/**
+ * Close a trailing unclosed fenced code block (``` or ~~~) so text appended
+ * after `markdown` — e.g. the expanded-view footer — renders BELOW the code
+ * block instead of inside it as literal characters (visible `**` asterisks).
+ * A closing fence must match the opening fence's character, be at least as
+ * long, and carry no info string. Balanced input passes through unchanged.
+ */
+export function closeOpenFences(markdown: string): string {
+  let fence: string | null = null;
+  for (const line of markdown.split(/\r?\n/)) {
+    const match = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!match) continue;
+    if (fence === null) {
+      fence = match[1];
+    } else if (
+      match[1][0] === fence[0] &&
+      match[1].length >= fence.length &&
+      match[2].trim() === ""
+    ) {
+      fence = null;
+    }
+  }
+  return fence === null ? markdown : `${markdown}\n${fence}`;
 }
 

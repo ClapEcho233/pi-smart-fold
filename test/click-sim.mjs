@@ -335,3 +335,80 @@ assert.match(
 );
 
 console.log("✓ scenario C: finished run in a streaming message toggles with one click");
+
+// ---- scenario D: code blocks inside thinking -------------------------------
+// Collapsed: when the last non-empty line is a bare code fence, the fold must
+// NOT fall back to the full markdown (that flash-open was the flicker).
+// Expanded: the footer must render OUTSIDE an unclosed fence — bold text, not
+// literal `**` asterisks (verified through pi's real Markdown renderer).
+import { Markdown } from "@earendil-works/pi-tui";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+
+const fireD = fire; // same handlers
+const md = (t) => ({ content: [{ type: "thinking", thinking: t }], stopReason: undefined });
+const streamD = (delta, partial) =>
+  fireD("message_update", {
+    message: { role: "assistant" },
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta, partial: md(partial) },
+  });
+
+// stream up to the opening fence: last non-empty line is the bare-ish fence
+await fireD("message_update", {
+  message: { role: "assistant" },
+  assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: md("") },
+});
+await streamD("consider the snippet\n```ts", "consider the snippet\n```ts");
+const compD = new AssistantMessageComponent();
+compD.updateContent(md("consider the snippet\n```ts"), true);
+assert.match(
+  render("consider the snippet\n```ts", true),
+  /^\*\*Thinking… \(\d+s\)\*\*\n\nconsider the snippet$/,
+  "bare fence as last line does not unfold the tail view",
+);
+
+// code content streams in: it becomes the tail line
+await streamD("\nconst x = 1;", "consider the snippet\n```ts\nconst x = 1;");
+compD.updateContent(md("consider the snippet\n```ts\nconst x = 1;"), true);
+assert.match(
+  render("consider the snippet\n```ts\nconst x = 1;", true),
+  /^\*\*Thinking… \(\d+s\)\*\*\n\nconst x = 1;$/,
+  "code content line shows as the tail",
+);
+
+// expand while the fence is still unclosed → fence closed, footer outside it
+click(compD, 0);
+const expandedD = render("consider the snippet\n```ts\nconst x = 1;", true);
+assert.match(
+  expandedD,
+  /```ts\nconst x = 1;\n```\n\n\*\*Thinking… \(\d+s\)\*\*$/,
+  "unclosed fence gets closed and the footer lands below it",
+);
+
+// render through pi's REAL Markdown component: the footer line must be bold
+// "Thinking… (Ns)" — no literal asterisks from being swallowed by the fence
+const stripAnsi = (s) => s.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
+const renderedD = new Markdown(expandedD, 1, 0, getMarkdownTheme()).render(80).map(stripAnsi);
+const lastLineD = [...renderedD].reverse().find((l) => l.trim() !== "");
+assert.match(lastLineD.trim(), /^Thinking… \(\d+s\)$/, "footer renders bold without literal asterisks");
+assert.equal(
+  renderedD.some((l) => l.includes("**Thinking")),
+  false,
+  "no raw ** markers leak into the render",
+);
+assert.equal(
+  renderedD.some((l) => l.includes("const x = 1;")),
+  true,
+  "code content still rendered",
+);
+
+// and the pre-fix behavior really did swallow the footer: sanity-check that
+// an unclosed fence without our close would show literal asterisks
+const unclosedView = "consider the snippet\n```ts\nconst x = 1;\n\n**Thinking… (8s)**";
+const renderedU = new Markdown(unclosedView, 1, 0, getMarkdownTheme()).render(80).map(stripAnsi);
+assert.equal(
+  renderedU.some((l) => l.includes("**Thinking…")),
+  true,
+  "sanity: unclosed fence would have swallowed the footer (regression guard)",
+);
+
+console.log("✓ scenario D: code blocks — no fold flicker, footer renders outside the fence");

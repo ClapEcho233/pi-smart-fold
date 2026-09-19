@@ -12,8 +12,10 @@ import {
   displayWidth,
   tailFit,
   lastNonEmptyLine,
+  lastMeaningfulLine,
   stripBlockMarkers,
   collapseThinking,
+  closeOpenFences,
   formatDuration,
   hashText,
   countLineDiff,
@@ -98,6 +100,22 @@ check("lastNonEmptyLine: skips whitespace lines", () => {
 });
 check("lastNonEmptyLine: all empty → empty string", () => {
   assert.equal(lastNonEmptyLine("\n \n"), "");
+});
+
+// ---------------------------------------------------- lastMeaningfulLine ----
+check("lastMeaningfulLine: picks last strippable non-empty line", () => {
+  assert.equal(lastMeaningfulLine("first\nsecond\n\n"), "second");
+  assert.equal(lastMeaningfulLine("plan:\n- [ ] do it", ), "[ ] do it");
+});
+check("lastMeaningfulLine: skips bare code fences (no fold flicker)", () => {
+  assert.equal(lastMeaningfulLine("thinking text\n```"), "thinking text");
+  assert.equal(lastMeaningfulLine("```js\ncode()\n```"), "code()");
+  assert.equal(lastMeaningfulLine("~~~\nquoted\n~~~"), "quoted");
+});
+check("lastMeaningfulLine: only structural lines → empty", () => {
+  assert.equal(lastMeaningfulLine("```"), "");
+  assert.equal(lastMeaningfulLine("```js"), "");
+  assert.equal(lastMeaningfulLine("\n \n"), "");
 });
 
 // ---------------------------------------------------- stripBlockMarkers ----
@@ -269,6 +287,23 @@ check("liveThinkingLine: truncates tail to width", () => {
 check("liveThinkingLine: empty content passes through", () => {
   assert.equal(liveThinkingLine("\n \n", 1_000, 80), "\n \n");
 });
+check("liveThinkingLine: bare fence last → label only, never the full text", () => {
+  // While a code block streams, the last non-empty line is often the bare
+  // fence — the fold must not flash open (the old fallback returned the full
+  // markdown, causing the flicker).
+  assert.equal(
+    liveThinkingLine("thought about code\n```", 8_000, 80),
+    "**Thinking… (8s)**\n\nthought about code",
+  );
+  assert.equal(liveThinkingLine("```", 8_000, 80), "**Thinking… (8s)**");
+  assert.equal(liveThinkingLine("```", undefined, 80), "");
+});
+check("liveThinkingLine: fence with info string is structural", () => {
+  assert.equal(
+    liveThinkingLine("before block\n```python", 3_000, 80),
+    "**Thinking… (3s)**\n\nbefore block",
+  );
+});
 check("foldedThinkingLine: smart shows bold Thought-for line", () => {
   assert.equal(
     foldedThinkingLine("anything at all", 12_340, 80, "smart"),
@@ -284,6 +319,16 @@ check("foldedThinkingLine: tail keeps the tail + bold duration", () => {
     "**12.3s** · last line",
   );
 });
+check("foldedThinkingLine: tail ending at a fence folds to the code line", () => {
+  // Thinking that ends with a code block ends with the closing fence —
+  // the fold must show the last code line, not unfold the whole block.
+  assert.equal(
+    foldedThinkingLine("intro\n```js\ncode()\n```", 12_340, 80, "tail"),
+    "**12.3s** · code()",
+  );
+  assert.equal(foldedThinkingLine("```", 12_340, 80, "tail"), "**Thought for 12.3s**");
+  assert.equal(foldedThinkingLine("```", undefined, 80, "tail"), "**Thought…**");
+});
 check("expandedThinkingSuffix: bold footer or empty", () => {
   assert.equal(expandedThinkingSuffix(61_500), "\n\n**Thought for 1m01s**");
   assert.equal(expandedThinkingSuffix(undefined), "");
@@ -295,6 +340,31 @@ check("liveExpandedSuffix: bold ticking footer at the bottom", () => {
   // appended after the full text, the timing line ends up as the last line
   const view = "first thought\nsecond thought" + liveExpandedSuffix(8_000);
   assert.equal(view.split("\n").at(-1), "**Thinking… (8s)**");
+});
+
+// ---------------------------------------------------------- closeOpenFences ----
+check("closeOpenFences: balanced fences pass through unchanged", () => {
+  assert.equal(closeOpenFences("text\n```js\ncode()\n```"), "text\n```js\ncode()\n```");
+  assert.equal(closeOpenFences("plain thinking"), "plain thinking");
+  assert.equal(closeOpenFences(""), "");
+});
+check("closeOpenFences: unclosed fence gets a matching close", () => {
+  assert.equal(closeOpenFences("text\n```js\ncode("), "text\n```js\ncode(\n```");
+  // longer opening fence needs an equally long close
+  assert.equal(closeOpenFences("````\ncode"), "````\ncode\n````");
+});
+check("closeOpenFences: tilde fences tracked separately", () => {
+  assert.equal(closeOpenFences("~~~\nquoted"), "~~~\nquoted\n~~~");
+  // a ``` line does not close a ~~~ fence (it is content), and vice versa
+  assert.equal(closeOpenFences("~~~\n```\nq"), "~~~\n```\nq\n~~~");
+});
+check("closeOpenFences: closing fence with info string does not close", () => {
+  assert.equal(closeOpenFences("```\ncode\n```js"), "```\ncode\n```js\n```");
+});
+check("closeOpenFences: footer appended after the close renders as bold", () => {
+  const view = closeOpenFences("thinking\n```js\ncode(") + "\n\n**Thinking… (8s)**";
+  assert.equal(view.split("\n").at(-1), "**Thinking… (8s)**");
+  assert.match(view, /```js\ncode\(\n```\n\n\*\*Thinking/);
 });
 
 // ------------------------------------------------------------ config ----

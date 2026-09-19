@@ -73,6 +73,7 @@ import { Container, SettingsList, Text, truncateToWidth } from "@earendil-works/
 import type { Component, SettingItem } from "@earendil-works/pi-tui";
 
 import {
+  closeOpenFences,
   countEditsLineDiff,
   countLineDiff,
   displayWidth,
@@ -661,7 +662,11 @@ export default function smartFold(pi: ExtensionAPI): void {
           mode === "full" ||
           expandAllThinking;
         if (open) {
-          return markdown.replace(/\s+$/, "") + expandedThinkingSuffix(ms);
+          // Close any unclosed code fence so the footer renders below the
+          // code block, not inside it as literal `**` characters.
+          return (
+            closeOpenFences(markdown.replace(/\s+$/, "")) + expandedThinkingSuffix(ms)
+          );
         }
         return foldedThinkingLine(markdown, ms, width, mode === "tail" ? "tail" : "smart");
       }
@@ -670,14 +675,20 @@ export default function smartFold(pi: ExtensionAPI): void {
       // run), with the ticking `Thinking… (Ns)` line pinned at the bottom.
       const openPrefix = openStreamingPrefix();
       if (openPrefix !== null && markdown.startsWith(openPrefix)) {
-        return markdown.replace(/\s+$/, "") + liveExpandedSuffix(tracker.liveElapsedMs());
+        // Close any unclosed code fence so the ticking footer stays outside
+        // the code block (otherwise it shows literal `**` asterisks).
+        return (
+          closeOpenFences(markdown.replace(/\s+$/, "")) +
+          liveExpandedSuffix(tracker.liveElapsedMs())
+        );
       }
       return liveThinkingLine(markdown, tracker.liveElapsedMs(), width);
     }
 
     if (mode === "full" || expandAllThinking || revealedBlocks.has(key)) {
-      // Fully expanded: original text, with the duration footer at the bottom.
-      return markdown.replace(/\s+$/, "") + expandedThinkingSuffix(ms);
+      // Fully expanded: original text, with the duration footer at the bottom
+      // (after closing any unclosed code fence so it renders as bold text).
+      return closeOpenFences(markdown.replace(/\s+$/, "")) + expandedThinkingSuffix(ms);
     }
     return foldedThinkingLine(markdown, ms, width, mode);
   });
