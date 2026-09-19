@@ -130,24 +130,29 @@ function resolveExtensionDir(): string | undefined {
 // (idempotently, shared across extension reloads via Symbol.for keys) to:
 //
 //   1. SEED every thinking run of a FINALIZED message with a hidden override
-//      when it has none yet. Finished thinking therefore starts collapsed in
-//      the hidden state — and since we also set the component's label text
-//      per message (`Thought for 12.4s`), the collapsed line keeps its
-//      duration. One click then flips the run to expanded (our transformer
-//      renders the full text), one click flips it back. Single click.
+//      when it has none yet (runs a streaming-era redirect left visible but
+//      folded are normalized into the seeded state as well). Finished
+//      thinking therefore starts collapsed in the hidden state — and since we
+//      also set the component's label text per message (`Thought for 12.4s`),
+//      the collapsed line keeps its duration. One click then flips the run to
+//      expanded (our transformer renders the full text), one click flips it
+//      back. Single click.
 //   2. CLEAR the overrides when expand-all is requested (mode "full" or the
 //      expand toggle), so every run renders expanded.
 //   3. DIFF the overrides map against a per-component snapshot to observe
 //      clicks exactly (seeding performed in the same pass is excluded, and
 //      clears are ignored) and record which block (content hash) was clicked
 //      plus a monotonic click sequence.
-//   4. REDIRECT clicks on the run that is still being written. pi's handler
-//      just toggled that run to the hidden-label state; we flip the override
-//      straight back to visible and toggle our own tail ↔ full mode instead,
-//      so one click switches between the scrolling tail and the full text
-//      (timing line pinned at the bottom) — the hidden middle state never
-//      shows. The MouseRegion click closure is rebuilt from the corrected
-//      map on every render, so each later click hits the same redirect.
+//   4. REDIRECT clicks on any thinking run of a STILL-STREAMING message.
+//      pi's handler just toggled that run to the hidden-label state; we flip
+//      the override straight back to visible and toggle our own mode
+//      instead. For the run still being written that switches between the
+//      scrolling tail and the full text (timing line pinned at the bottom);
+//      for a run that already finished while the message keeps streaming it
+//      switches between the folded duration line and the full text with its
+//      footer. The MouseRegion click closure is rebuilt from the corrected
+//      map on every render, so each later click hits the same redirect and
+//      the hidden middle state (the global `Thought…` label) never shows.
 //
 // The markdown transformer uses that click signal only to mark a block as
 // user-revealed (add-only), so unflagged re-renders of expanded blocks keep
@@ -167,8 +172,19 @@ interface SmartFoldGlobalState {
    * the tracker's open group (unlike `durationFor`).
    */
   isLiveRun(runText: string): boolean;
+  /**
+   * True when a FINISHED run of a still-streaming message currently renders
+   * expanded (revealed by a click, or matched by the streaming open prefix,
+   * or expand-all/full mode) — mirrors the transformer's `open` condition.
+   */
+  isFinishedRunOpen(runText: string): boolean;
   /** Called when the user collapses a live run back to the scrolling tail. */
   onLiveCollapse?(runText: string): void;
+  /**
+   * Called when the user collapses a finished run of a still-streaming
+   * message back to its folded duration line.
+   */
+  onFinishedCollapse?(runText: string): void;
 }
 
 type SmartFoldGlobal = typeof globalThis & { [SF_STATE]?: SmartFoldGlobalState };
@@ -229,6 +245,7 @@ function installThinkingDisplayPatch(): void {
         const overrides = self.thinkingVisibilityOverrides;
         if (state && state.behavior !== "inert" && overrides instanceof Map) {
           const previous = self[OVERRIDE_SNAPSHOT];
+          const previousMap = previous === undefined ? undefined : new Map(previous);
           const seeded = new Set<number>();
           const finalized =
             (isStreaming === undefined ? self.isStreaming !== true : isStreaming === false);
@@ -242,6 +259,21 @@ function installThinkingDisplayPatch(): void {
               // and refresh the per-message hidden label with its duration.
               for (let run = 0; run < runs.length; run++) {
                 if (!overrides.has(run)) {
+                  overrides.set(run, true);
+                  seeded.add(run);
+                } else if (
+                  overrides.get(run) === false &&
+                  previousMap?.get(run) === false && // leftover, not a fresh click
+                  runs[run] !== undefined &&
+                  state.isFinishedRunOpen?.(runs[run]) !== true
+                ) {
+                  // A streaming-era redirect left this run visible but folded
+                  // (the user collapsed it again, or it was never opened).
+                  // Normalize it into the seeded hidden state — the folded
+                  // line and the per-message label read the same, so without
+                  // this the next click would appear to change nothing.
+                  // Marked seeded so the diff below does not mistake the
+                  // normalization for a click.
                   overrides.set(run, true);
                   seeded.add(run);
                 }
@@ -263,24 +295,32 @@ function installThinkingDisplayPatch(): void {
             if (changedRun !== null) {
               const runText = thinkingRunText(self.lastMessage ?? message, changedRun);
               const clickedHidden = new Map(current).get(changedRun) === true;
-              if (
-                clickedHidden &&
-                !finalized &&
-                runText !== null &&
-                state.isLiveRun?.(runText) === true // live = no finalized duration yet
-              ) {
-                // Single-click tail ↔ full on the run still being written:
-                // pi just flipped it to the hidden-label state. Redirect —
-                // keep the run visible and switch our own mode instead. The
-                // click closure is rebuilt from the corrected map, so every
-                // later click lands here again: no hidden middle state.
-                const openPrefix = openStreamingPrefix();
-                if (openPrefix !== null && runText.startsWith(openPrefix)) {
-                  state.onLiveCollapse?.(runText); // drop any stale reveal mark
-                  setStreamingOpenPrefix(null); // full → scrolling tail
+              if (clickedHidden && !finalized && runText !== null) {
+                // A click on a thinking run of a still-streaming message just
+                // flipped it to pi's hidden-label state — which would show the
+                // global `Thought…` label (per-message labels are only set
+                // once finalized). Redirect: keep the run visible and toggle
+                // our own mode instead. The click closure is rebuilt from the
+                // corrected map, so every later click lands here again — one
+                // click per state change, no hidden middle state.
+                if (state.isLiveRun?.(runText) === true) {
+                  // Run still being written: scrolling tail ↔ full text so
+                  // far, timing line pinned at the bottom of the full view.
+                  const openPrefix = openStreamingPrefix();
+                  if (openPrefix !== null && runText.startsWith(openPrefix)) {
+                    state.onLiveCollapse?.(runText); // drop any stale reveal mark
+                    setStreamingOpenPrefix(null); // full → scrolling tail
+                  } else {
+                    recordRevealClick(runText); // tail → full text so far
+                    setStreamingOpenPrefix(runText);
+                  }
+                } else if (state.isFinishedRunOpen?.(runText) === true) {
+                  // Run already finished while the message keeps streaming:
+                  // full text → folded duration line.
+                  state.onFinishedCollapse?.(runText);
                 } else {
-                  recordRevealClick(runText); // tail → full text so far
-                  setStreamingOpenPrefix(runText);
+                  // Finished run, currently folded: → full text + footer.
+                  recordRevealClick(runText);
                 }
                 overrides.set(changedRun, false);
                 current = Array.from(overrides.entries());
@@ -389,6 +429,16 @@ function openStreamingPrefix(): string | null {
 
 function clearOpenStreamingPrefix(): void {
   (globalThis as ClickGlobal)[CLICK_OPEN_PREFIX] = null;
+}
+
+/**
+ * Forget the last recorded click so a re-render inside the click window
+ * cannot re-reveal a block the user just collapsed.
+ */
+function clearRevealClick(): void {
+  const clickGlobal = globalThis as ClickGlobal;
+  clickGlobal[CLICK_AT] = undefined;
+  clickGlobal[CLICK_HASH] = undefined;
 }
 
 /** How long after a click its re-render is expected (generous for slow frames). */
@@ -502,8 +552,23 @@ export default function smartFold(pi: ExtensionAPI): void {
       durationFor: (runText: string) =>
         tracker.finalizedMs(hashText(runText)) ?? tracker.finalizeIfMatches(runText),
       isLiveRun: (runText: string) => tracker.finalizedMs(hashText(runText)) === undefined,
+      isFinishedRunOpen: (runText: string) => {
+        if (revealedBlocks.has(hashText(runText))) return true;
+        const prefix = openStreamingPrefix();
+        if (prefix !== null && runText.startsWith(prefix)) return true;
+        return config.thinking === "full" || expandAllThinking;
+      },
       onLiveCollapse: (runText: string) => {
         revealedBlocks.delete(hashText(runText));
+        clearRevealClick();
+      },
+      onFinishedCollapse: (runText: string) => {
+        revealedBlocks.delete(hashText(runText));
+        const prefix = openStreamingPrefix();
+        if (prefix !== null && runText.startsWith(prefix)) {
+          setStreamingOpenPrefix(null); // that prefix was this run's text
+        }
+        clearRevealClick();
       },
     };
   };

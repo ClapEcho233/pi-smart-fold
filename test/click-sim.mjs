@@ -7,7 +7,9 @@
  *   streaming:  tail →(click)→ full →(click)→ tail →(click)→ full …
  *               full view keeps the ticking `Thinking… (Ns)` line at the
  *               BOTTOM of the block; the hidden-label middle state never
- *               appears.
+ *               appears. Same one-click toggle for a run that already
+ *               finished while the message keeps streaming (folded duration
+ *               line ↔ full text with footer).
  *   finalized:  seeded hidden `Thought for …` label →(click)→ full+footer
  *               →(click)→ label …
  *
@@ -205,20 +207,131 @@ compB.updateContent(compB.lastMessage);
 assert.equal(compB.thinkingVisibilityOverrides.get(1), false, "live-run click redirected");
 assert.match(render("second run", true), /^second run\n\n\*\*Thinking… /, "live run expanded");
 
-// clicking the finished run (hidden toggle) must not collapse the live run
-compB.thinkingVisibilityOverrides.set(0, true);
+// clicking the finished run while the message still streams: ONE click
+// expands it directly — the global `Thought…` hidden-label middle state
+// must never appear (this was the reported bug)
+compB.thinkingVisibilityOverrides.set(0, true); // pi click handler for run 0
 compB.updateContent(compB.lastMessage);
-assert.equal(compB.thinkingVisibilityOverrides.get(0), true, "finished run toggles natively");
+assert.equal(compB.thinkingVisibilityOverrides.get(0), false, "finished-run click redirected to visible");
+assert.match(
+  render("first run", true),
+  /^first run\n\n\*\*Thought for /,
+  "one click expands the finished run with the footer",
+);
 assert.match(
   render("second run", true),
   /^second run\n\n\*\*Thinking… /,
   "finished-run click does not clobber the live run's open state",
 );
 
-// clicking it back open reveals the finished run, live run still untouched
-compB.thinkingVisibilityOverrides.set(0, false);
+// clicking it again folds the finished run back to the duration line
+compB.thinkingVisibilityOverrides.set(0, true);
 compB.updateContent(compB.lastMessage);
-assert.match(render("first run", true), /^first run\n\n\*\*Thought for /, "finished run expands with footer");
-assert.match(render("second run", true), /^second run\n\n\*\*Thinking… /, "live run still expanded");
+assert.equal(compB.thinkingVisibilityOverrides.get(0), false, "still visible after collapse");
+assert.match(
+  render("first run", true),
+  /^\*\*Thought for /,
+  "second click re-folds the finished run (no label middle state)",
+);
+assert.match(
+  render("second run", true),
+  /^second run\n\n\*\*Thinking… /,
+  "live run still expanded",
+);
+
+// third click expands again — a clean two-state toggle
+compB.thinkingVisibilityOverrides.set(0, true);
+compB.updateContent(compB.lastMessage);
+assert.match(
+  render("first run", true),
+  /^first run\n\n\*\*Thought for /,
+  "third click expands again",
+);
 
 console.log("✓ scenario B: finished-run clicks leave the live run's toggle intact");
+
+// ---- scenario C: the reported regression — single run finished, answer
+// text still streaming. `Thought for …` → click → full text, click → folded
+// again. Never the global `Thought…` label. --------------------------------
+const fireC = fire; // same handlers
+const msgC = (thinking, text) => ({
+  content: [
+    { type: "thinking", thinking },
+    { type: "text", text },
+  ],
+  stopReason: undefined,
+});
+const thinkOnly = (t) => ({ content: [{ type: "thinking", thinking: t }], stopReason: undefined });
+await fireC("message_update", {
+  message: { role: "assistant" },
+  assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: thinkOnly("") },
+});
+await fireC("message_update", {
+  message: { role: "assistant" },
+  assistantMessageEvent: {
+    type: "thinking_delta",
+    contentIndex: 0,
+    delta: "plan the answer",
+    partial: thinkOnly("plan the answer"),
+  },
+});
+await fireC("message_update", {
+  message: { role: "assistant" },
+  assistantMessageEvent: { type: "thinking_end", contentIndex: 0, partial: thinkOnly("plan the answer") },
+});
+// the following text block closes the thinking run: it now has a finalized
+// duration while the message itself is still streaming
+await fireC("message_update", {
+  message: { role: "assistant" },
+  assistantMessageEvent: {
+    type: "text_start",
+    contentIndex: 1,
+    partial: msgC("plan the answer", ""),
+  },
+});
+
+const compC = new AssistantMessageComponent();
+compC.updateContent(msgC("plan the answer", "answering…"), true);
+assert.match(
+  render("plan the answer", true),
+  /^\*\*Thought for /,
+  "finished run folds while the answer still streams",
+);
+
+// click 1 → full text + footer (NOT the global `Thought…` label)
+compC.thinkingVisibilityOverrides.set(0, true);
+compC.updateContent(compC.lastMessage);
+assert.equal(compC.thinkingVisibilityOverrides.get(0), false, "click redirected to visible");
+assert.match(
+  render("plan the answer", true),
+  /^plan the answer\n\n\*\*Thought for /,
+  "one click expands to full text with the footer",
+);
+
+// click 2 → folded duration line again
+compC.thinkingVisibilityOverrides.set(0, true);
+compC.updateContent(compC.lastMessage);
+assert.equal(compC.thinkingVisibilityOverrides.get(0), false, "still visible after collapse");
+assert.match(
+  render("plan the answer", true),
+  /^\*\*Thought for /,
+  "second click re-folds to the duration line",
+);
+
+// message ends: the run left folded normalizes into the seeded hidden state
+// (label with duration) so the next click expands directly
+await fireC("message_end", {
+  message: { role: "assistant", ...msgC("plan the answer", "answering…"), stopReason: "stop" },
+});
+compC.updateContent(compC.lastMessage, false);
+assert.equal(compC.thinkingVisibilityOverrides.get(0), true, "collapsed run normalized to seeded hidden");
+assert.match(compC.hiddenThinkingLabel, /Thought for /, "label carries the duration");
+compC.thinkingVisibilityOverrides.set(0, false);
+compC.updateContent(compC.lastMessage);
+assert.match(
+  render("plan the answer", false),
+  /^plan the answer\n\n\*\*Thought for /,
+  "click after finalize expands in one step",
+);
+
+console.log("✓ scenario C: finished run in a streaming message toggles with one click");

@@ -1,61 +1,67 @@
 # pi-smart-fold
 
-[pi](https://github.com/earendil-works/pi-mono) coding-agent 插件：保持会话记录紧凑，同时不丢失关键信息。
+A [pi](https://github.com/earendil-works/pi-mono) coding-agent extension that keeps the session transcript compact — without losing key information.
 
-## 功能
+| Without smart-fold | With smart-fold |
+| --- | --- |
+| Long thinking walls, verbose tool output, full file previews | One-line `Thought for 12.4s` summaries, folded tool output, `write src/index.ts +12 -3` headers |
 
-### 1. Thinking 折叠 + 计时（`smart` 默认）
+## Features
 
-- **思考中**：首行显示加粗的 **`Thinking… (8s)`**，换行后滚动显示思考文本的**结尾**（如 `tail -f`）。**点击一次 → 直接切换为完整显示至今全部思考内容**（持续跟随增长，加粗的实时计时行 **`Thinking… (8s)`** 固定在思考块**最底部**并持续更新）；**再点一次 → 回到滚动结尾**。没有中间标签状态，始终在 滚动结尾 ↔ 完整显示 间单击切换：
+### 1. Thinking fold + live timer (`smart` mode, default)
 
-  ```text
-  滚动显示（默认）              完整显示（点击后）
-  Thinking… (8s)               …前面的思考内容…
-  …正在进行的思考最新一行        正在进行的思考……
-                               Thinking… (9s)   ← 固定在底部、持续更新
-  ```
-
-- **思考结束后**：若该段思考当时正处于完整显示，会平滑过渡为底部 **`Thought for 12.4s`** 定格时长行；消息结束后默认完全折叠为一行加粗的 **`Thought for 12.4s`**。
-- **单击展开/收起单个思考块**：思考结束后默认进入隐藏态（由原型补丁预置），折叠行就是 **`Thought for 12.4s`** 标签（加粗、带实测时长）。**点击一次 → 该块展开为完整思考全文**（底部保留加粗的时长行，与斜体思考正文风格稍作区分）；**再点一次 → 收起**。没有中间状态，只影响被点击的块，同一消息里的其它思考块不受干扰。
-- **完全接管原生折叠**：pi 内置的思考隐藏标签（`Thinking...`）被替换为本插件按消息生成的 `Thought for …` 标签，点击与 ctrl+t 出现的都是我们的文本，而不是原生的 `Thinking...`（smart 模式下 ctrl+t 无额外效果，用点击或 `/fold expand` 展开）。
-- **点击识别是精确的**：通过对 pi 公开导出的 `AssistantMessageComponent` 打一个幂等的原型补丁，预置完成思考的隐藏态并观测其内部可见性映射的点击写入（区分 ctrl+t 的清空操作）；思考中的单击会被重定向（改回可见并切换插件自己的 滚动↔完整 模式），原生两态切换的中间“隐藏标签”态永远不会出现。主题切换 / 窗口缩放 / 布局重绘等全局重渲染绝不会误判为点击；若未来版本无法安装补丁，自动降级为 pi 原生显示（可用 `/fold expand` 兜底）。
-- **时长持久化**：每段思考的时长按内容哈希记录进会话文件（`smart-fold-thinking` 自定义条目，不进入 LLM 上下文），`/resume` 恢复会话后依旧显示；同一条消息内多段思考（工具调用之间）分别计时。
-- 截断按**终端显示宽度**计算（中文 / emoji 等宽字符占 2 列），超宽时保留行尾并加 `…` 前缀。
-- 折叠仅影响 TUI 显示，不改动会话文件中的原文与发送给模型的上下文。
-
-其它模式：`tail`（始终单行显示结尾 + 加粗时长前缀）、`full`（结束后直接显示全文，底部同样附时长行）、`off`（关闭，并恢复 pi 默认的思考显示）。
-
-备用：`/fold expand on|off`（或设置面板中的"展开全部思考"）临时展开/折叠全部思考块 —— 日常操作直接点击单个思考块即可，新会话默认全部折叠。
-
-### 2. 工具输出折叠
-
-每次 `session_start`（启动 / `/reload` / `/new` / `/resume` / `/fork`）自动调用 `ctx.ui.setToolsExpanded(false)`，工具输出保持折叠，`ctrl+o` 手动展开。
-
-### 3. 工具调用行截断 + Write/Edit 增删统计
-
-- **调用命令过长时截断**：`bash`/`read`/`grep`/`find`/`ls` 等工具的调用行在折叠状态下截断为单行，超宽时以 `…` 结尾（pi 自带的 ANSI 感知 `truncateToWidth`），命令还有后续行时追加 ` …` 标记；点击或 `ctrl+o` 展开后与工具输出一起完整显示。
-- **write / edit 增删统计**：
-  - write：执行**前**读取原文件内容，与写入内容做行级 diff（公共前后缀裁剪 + LCS），首行追加 **绿色 `+新增` / 红色 `-删除`**，如 `write src/index.ts +12 -3`；新文件 `+N -0`；超大文件（>8MB）跳过。统计随工具结果**持久化进会话文件**，恢复历史会话后依旧显示（本版本之前产生的旧写入没有记录，不显示）。
-  - edit：直接对各 `edits` 的 `oldText → newText` 做行级 diff 并求和，如 `edit src/app.ts +2 -1`（参数流式传输时就实时更新）。
-- **write/edit 默认完全折叠，不显示任何代码内容/差异**：折叠时调用区和结果区都只剩一行头部（`writeCollapsed: header` 默认；pi 原生没有此能力，通过对 renderCall + renderResult 的双重包装实现 —— 结果区的 diff 在折叠时返回空组件，错误信息仍会显示）；点击 / `ctrl+o` 展开后显示完整差异 / 语法高亮内容，**头部行在折叠和展开时都保留 `+N -M` 统计**（edit 自带外壳的背景条完整保留，统计注入行尾填充、行宽不变）。可在设置中改回 `preview` 恢复 pi 原生预览。
-- 实现方式为对 pi 内置工具的渲染包装（执行逻辑完全复用各 `create*ToolDefinition`）。
-
-## 设置界面
-
-```
-/fold        打开 /config 样式的选择式设置（Enter/Space 切换值，Esc 关闭）
-```
-
-也可带参数直接修改（含自动补全）：
+**While the model thinks**, the block shows a bold **`Thinking… (8s)`** header line, followed by the scrolling *tail* of the thinking text (like `tail -f`). **One click toggles directly to the full text so far** (the ticking **`Thinking… (8s)`** line stays pinned at the bottom and keeps updating); **one more click toggles back** to the scrolling tail. There is no intermediate label state — a single click always switches between `scrolling tail ↔ full view`:
 
 ```text
-/fold thinking smart|tail|full|off   # on=smart, off=off 兼容旧写法
-/fold tools on|off                   # 启动时是否折叠工具输出
-/fold writestat on|off               # write 增删统计开关
-/fold writecollapsed header|preview  # write 折叠时仅首行 / 保留预览
+Scrolling tail (default)          Full view (after one click)
+Thinking… (8s)                    …earlier thinking text…
+…latest line of thinking          …thinking still streaming…
+                                  Thinking… (9s)   ← pinned at the bottom, live-updating
 ```
 
-配置文件 `smart-fold.config.json`（位于插件目录，可手工编辑；旧的 `thinkingFold` 布尔值会自动迁移）：
+**After the thinking run finishes**, the block collapses to a single bold **`Thought for 12.4s`** line (measured duration). If the block was in full view at that moment, it transitions smoothly to the pinned duration footer first.
+
+**Single-click expand/collapse per block**: finished thinking starts hidden (seeded by a prototype patch). **One click → that block expands to its full text** (with the bold duration line kept at the bottom); **one more click → collapses back**. No intermediate states, and only the clicked block is affected — other thinking runs in the same message are untouched. The same one-click toggle works for a run that already finished *while its message is still streaming* (e.g. thinking done, answer text or a tool call still coming): the folded `Thought for …` line expands directly — never through pi's bare `Thought…` label middle state.
+
+- **Fully takes over native folding**: pi's built-in hidden-thinking label (`Thinking...`) is replaced with per-message `Thought for …` labels generated by this extension. What you see after clicks or `ctrl+t` is always our text, never the native one. (In `smart` mode `ctrl+t` has no extra effect — use clicks or `/fold expand` instead.)
+- **Exact click detection**: an idempotent prototype patch on pi's publicly exported `AssistantMessageComponent` seeds the hidden state of finished thinking runs and observes writes to the component's internal visibility map (distinguishing `ctrl+t`'s clear operation). Clicks on runs of a still-streaming message — the live run as well as already-finished ones — are redirected so the native two-state toggle's hidden middle state never appears. Global re-renders — theme changes, window resizes, layout redraws — are never mistaken for clicks. If a future pi version can't be patched, the extension degrades gracefully to pi's native display (with `/fold expand` as a fallback).
+- **Persistent durations**: each thinking run's duration is recorded in the session file keyed by content hash (a `smart-fold-thinking` custom entry, never sent to the LLM context), so durations still show after `/resume`. Multiple thinking runs within one message (between tool calls) are timed individually.
+- Truncation is measured in **terminal display columns** (CJK characters / emoji count as 2), keeping the line ending with an `…` prefix when over-wide.
+- Folding is **display-only**: the session file and the context sent to the model are never modified.
+
+Other modes: `tail` (always one line — the text tail with a bold duration prefix), `full` (show full text after the run ends, with the duration footer), `off` (disable and restore pi's default thinking display).
+
+Fallback: `/fold expand on|off` (or "Expand all thinking" in the settings panel) temporarily expands/collapses *all* finished thinking blocks. Daily usage only needs single clicks on individual blocks; new sessions always start fully folded.
+
+### 2. Tool output folding
+
+On every `session_start` (startup, `/reload`, `/new`, `/resume`, `/fork`) the extension calls `ctx.ui.setToolsExpanded(false)` so tool output stays collapsed; press `ctrl+o` to expand manually.
+
+### 3. Tool call line truncation + write/edit diff stats
+
+- **Long call lines are truncated**: `bash` / `read` / `grep` / `find` / `ls` call lines collapse to a single line, cut to the terminal width with a trailing `…` (pi's ANSI-aware `truncateToWidth`). An extra ` …` marker is appended when the command has more lines. Click or `ctrl+o` to expand and see everything.
+- **write / edit line-diff stats**:
+  - `write`: reads the original file content *before* the write executes and computes a line-level diff (common prefix/suffix trimming + LCS). The header line gains a **green `+added` / red `-removed`** suffix, e.g. `write src/index.ts +12 -3`; new files show `+N -0`. Files larger than 8 MB are skipped. Stats are **persisted with the tool result in the session file**, so they still show in restored sessions (writes made before this version have no record and show nothing).
+  - `edit`: diffs each `edits[]` entry's `oldText → newText` directly and sums the result, e.g. `edit src/app.ts +2 -1` (updates live while arguments stream in).
+- **write/edit collapse to a header-only line by default** (`writeCollapsed: header`): collapsed rows show just the one-line header — no code content or diff preview (not natively possible in pi; implemented by wrapping both `renderCall` and `renderResult` — the result area renders an empty component while collapsed, and error messages remain visible). Click / `ctrl+o` expands to the full diff / syntax-highlighted content. The **`+N -M` stat stays in the header line in both states** (edit's native full-width background bar is preserved; the stat is injected into the trailing padding without changing the line width). Switch to `preview` in settings to restore pi's native preview.
+- Implemented as rendering wrappers around pi's built-in tools (execution logic is fully reused from each `create*ToolDefinition`).
+
+## Settings
+
+```
+/fold        Open a /config-style interactive settings list (Enter/Space to change, Esc to close)
+```
+
+Or change values directly (with autocompletion):
+
+```text
+/fold thinking smart|tail|full|off   # on=smart, off=off accepted for compatibility
+/fold tools on|off                   # fold tool output at session start
+/fold writestat on|off               # write/edit diff stats toggle
+/fold writecollapsed header|preview  # write rows: header-only / keep preview when collapsed
+```
+
+Config file `smart-fold.config.json` (next to the extension entry; the legacy boolean `thinkingFold` is migrated automatically):
 
 ```json
 {
@@ -66,52 +72,52 @@
 }
 ```
 
-## 安装
+## Installation
 
-任选其一：
+Any one of these:
 
 ```bash
-# 方式 A：作为目录插件放入全局自动发现路径
+# Option A: clone into pi's global extension auto-discovery directory
 git clone <this-repo> ~/.pi/agent/extensions/smart-fold
 
-# 方式 B：通过 pi 包管理安装
+# Option B: install via the pi package manager
 pi install git:<repo-url>
 
-# 方式 C：加入 settings.json
+# Option C: add to settings.json
 # ~/.pi/agent/settings.json → { "extensions": ["/path/to/pi-smart-fold"] }
 
-# 临时测试
+# Try it temporarily
 pi -e /path/to/pi-smart-fold/index.ts
 ```
 
-> 插件无任何 npm 依赖，pi 通过 jiti 直接加载 TypeScript。
+> The extension has no npm dependencies — pi loads the TypeScript directly via jiti.
 
-## 开发
+## Development
 
 ```bash
-npm test          # 纯函数单元测试（Node ≥ 22.18 原生 TS 类型剥离，无需构建）
-npm run test:sim  # 点击周期仿真：驱动真实 pi AssistantMessageComponent
-                  # （需先把已安装的 pi 包符号链接到 node_modules/@earendil-works）
+npm test          # unit tests for the pure functions (native TS type stripping, Node ≥ 22.18, no build step)
+npm run test:sim  # click-cycle simulation against the real pi AssistantMessageComponent
+                  # (first symlink the installed pi package into node_modules/@earendil-works)
 ```
 
-结构：
+Project layout:
 
 ```
-index.ts           插件入口（transformer / 事件 / write 渲染包装 / /fold 设置界面）
-lib/fold.ts        纯函数：显示宽度、行尾截断、时长格式化、行级 diff
-lib/thinking.ts    思考计时状态机（按内容哈希记录各段思考时长）
-lib/config.ts      配置读写（含旧配置迁移；缺失/损坏时回退默认值）
-test/fold.test.mjs 单元测试
-test/click-sim.mjs 点击周期仿真（真实 pi 组件 + 模拟点击，验证 滚动↔完整 切换）
+index.ts           Extension entry (transformer / events / write render wrappers / /fold settings UI)
+lib/fold.ts        Pure functions: display width, tail truncation, duration formatting, line diff
+lib/thinking.ts    Thinking timer state machine (per-run durations keyed by content hash)
+lib/config.ts      Config load/save (with legacy migration; falls back to defaults when missing/corrupt)
+test/fold.test.mjs Unit tests
+test/click-sim.mjs Click-cycle simulation (real pi component + simulated clicks, verifies tail ↔ full toggling)
 ```
 
-## 已知边界
+## Known limitations
 
-- 思考中的单击切换依赖原型补丁的重定向；补丁不可用时降级为 pi 原生两态切换（此时需两次点击展开）。
-- 展开状态为运行时状态，新会话/重载后恢复折叠；窗口缩放不会收起你已展开的块。
-- write 增删统计只对当前会话中的写入生效（恢复的旧会话没有执行前快照可对比）。
-- 与 pi 原生 "Hide thinking blocks"（`ctrl+t` 切换）叠加时，若隐藏了思考块，思考中不会显示滚动行 —— 建议保持默认的显示状态，由本插件负责折叠。
+- Single-click toggling of thinking runs in a *live* message depends on the prototype patch's redirect; without the patch it degrades to pi's native two-state toggle (two clicks to expand).
+- Expand state is runtime-only: new sessions/reloads start folded again. Window resizes never collapse blocks you've expanded.
+- write diff stats only apply to writes executed in the current session (restored older sessions have no pre-execution snapshot to diff against).
+- When stacked with pi's native "Hide thinking blocks" (`ctrl+t` toggle): if thinking is hidden that way, the live scrolling line won't show — keep the native display at its default and let this extension handle folding.
 
-## 兼容性
+## Compatibility
 
-基于 pi `0.85.1` 的公开扩展 API（`registerMarkdownTransformer`、`ctx.ui.setToolsExpanded`、`createWriteToolDefinition`、`registerCommand`、`appendEntry`、`SettingsList`）。
+Built against pi `0.85.1` public extension APIs: `registerMarkdownTransformer`, `ctx.ui.setToolsExpanded`, `createWriteToolDefinition` (and friends), `registerCommand`, `appendEntry`, `SettingsList`.
