@@ -96,20 +96,30 @@ pi -e /path/to/pi-smart-fold/index.ts
 ## Development
 
 ```bash
-npm test          # unit tests for the pure functions (native TS type stripping, Node ≥ 22.18, no build step)
-npm run test:sim  # click-cycle simulation against the real pi AssistantMessageComponent
-                  # (first symlink the installed pi package into node_modules/@earendil-works)
+npm install        # dev deps + relink node_modules/@earendil-works to the installed pi (postinstall)
+npm run link:pi    # re-point the type/runtime links after a pi upgrade — always current version
+npm run typecheck  # strict tsc against the installed pi's .d.ts (no emit)
+npm run check      # link + typecheck + jiti load-check + unit tests + click simulation
+npm test           # unit tests for the pure functions (native TS type stripping, Node ≥ 22.18, no build step)
+npm run test:sim   # click-cycle simulation against the real pi AssistantMessageComponent
 ```
+
+The extension itself has no npm dependencies — pi loads the TypeScript directly via jiti.
+`typescript` / `@types/node` are dev-only, and `node_modules/@earendil-works/*` are symlinks into
+the pi installation that loads the extension (created by `scripts/link-pi.mjs`), so typecheck
+always runs against the exact pi version installed on the machine.
 
 Project layout:
 
 ```
-index.ts           Extension entry (transformer / events / write render wrappers / /fold settings UI)
-lib/fold.ts        Pure functions: display width, tail truncation, duration formatting, line diff
-lib/thinking.ts    Thinking timer state machine (per-run durations keyed by content hash)
-lib/config.ts      Config load/save (with legacy migration; falls back to defaults when missing/corrupt)
-test/fold.test.mjs Unit tests
-test/click-sim.mjs Click-cycle simulation (real pi component + simulated clicks, verifies tail ↔ full toggling)
+index.ts                Extension entry (transformer / events / write render wrappers / /fold settings UI)
+lib/fold.ts             Pure functions: display width, tail truncation, duration formatting, line diff
+lib/thinking.ts         Thinking timer state machine (per-run durations keyed by content hash)
+lib/config.ts           Config load/save (with legacy migration; falls back to defaults when missing/corrupt)
+scripts/link-pi.mjs     Symlink the installed pi runtime into node_modules (version-following)
+scripts/load-check.mjs  Smoke test: load the extension via pi's jiti and exercise registration
+test/fold.test.mjs      Unit tests
+test/click-sim.mjs      Click-cycle simulation (real pi component + simulated clicks, verifies tail ↔ full toggling)
 ```
 
 ## Known limitations
@@ -121,4 +131,11 @@ test/click-sim.mjs Click-cycle simulation (real pi component + simulated clicks,
 
 ## Compatibility
 
-Built against pi `0.85.1` public extension APIs: `registerMarkdownTransformer`, `ctx.ui.setToolsExpanded`, `createWriteToolDefinition` (and friends), `registerCommand`, `appendEntry`, `SettingsList`.
+Built and verified against pi **`0.86.1`** public extension APIs: `registerMarkdownTransformer`,
+`ctx.ui.setToolsExpanded` / `setHiddenThinkingLabel`, `create*ToolDefinition` (and friends),
+`registerTool` (`renderCall` / `renderResult` + `ToolRenderContext`), `registerCommand`, `appendEntry`,
+`SettingsList`, and the `AssistantMessageComponent` click-internals patch (`updateContent`,
+`thinkingVisibilityOverrides`, `hiddenThinkingLabel`).
+
+After upgrading pi, run `npm run link:pi && npm run check` — the links follow the newly installed
+version automatically, and the check verifies types, jiti loading, and behavior against it.

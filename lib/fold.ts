@@ -279,19 +279,22 @@ export function countLineDiff(
  * (supports the legacy single oldText/newText shape). Returns undefined when
  * there is nothing renderable.
  */
-export function countEditsLineDiff(
-  input: { edits?: unknown; oldText?: unknown; newText?: unknown } | undefined,
-): LineDiffStat | undefined {
+export function countEditsLineDiff(input: unknown): LineDiffStat | undefined {
   if (!input || typeof input !== "object") return undefined;
-  const edits = Array.isArray(input.edits)
-    ? input.edits
-    : typeof input.oldText === "string" && typeof input.newText === "string"
-      ? [{ oldText: input.oldText, newText: input.newText }]
+  const { edits, oldText, newText } = input as {
+    edits?: unknown;
+    oldText?: unknown;
+    newText?: unknown;
+  };
+  const editList = Array.isArray(edits)
+    ? edits
+    : typeof oldText === "string" && typeof newText === "string"
+      ? [{ oldText, newText }]
       : [];
   let added = 0;
   let removed = 0;
   let seen = false;
-  for (const edit of edits as Array<{ oldText?: unknown; newText?: unknown }>) {
+  for (const edit of editList as Array<{ oldText?: unknown; newText?: unknown }>) {
     if (!edit || typeof edit !== "object") continue;
     const oldText = typeof edit.oldText === "string" ? edit.oldText : undefined;
     const newText = typeof edit.newText === "string" ? edit.newText : undefined;

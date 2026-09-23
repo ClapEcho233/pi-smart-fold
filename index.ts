@@ -230,7 +230,7 @@ function installThinkingDisplayPatch(): void {
     }
   ).prototype;
   const original = proto?.updateContent;
-  if (typeof original !== "function") return;
+  if (!proto || typeof original !== "function") return;
   if ("__smartFoldPatched" in original) return; // already installed by a previous load
   try {
     const patched = function (this: unknown, message: unknown, isStreaming?: boolean) {
