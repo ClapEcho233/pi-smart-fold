@@ -84,6 +84,9 @@ git clone <this-repo> ~/.pi/agent/extensions/smart-fold
 # Option B: install via the pi package manager
 pi install git:<repo-url>
 
+# Option B2: install from npm
+pi install @clapecho233/pi-smart-fold
+
 # Option C: add to settings.json
 # ~/.pi/agent/settings.json → { "extensions": ["/path/to/pi-smart-fold"] }
 

@@ -1,5 +1,5 @@
 {
-  "name": "pi-smart-fold",
+  "name": "@clapecho233/pi-smart-fold",
   "version": "0.2.1",
   "description": "pi coding-agent extension: collapse tool output at startup and fold thinking blocks to a live last line",
   "type": "module",
