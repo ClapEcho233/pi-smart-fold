@@ -131,7 +131,7 @@ test/click-sim.mjs      Click-cycle simulation (real pi component + simulated cl
 
 ## Compatibility
 
-Built and verified against pi **`0.86.1`** public extension APIs: `registerMarkdownTransformer`,
+Built and verified against pi **`0.87.1`** public extension APIs: `registerMarkdownTransformer`,
 `ctx.ui.setToolsExpanded` / `setHiddenThinkingLabel`, `create*ToolDefinition` (and friends),
 `registerTool` (`renderCall` / `renderResult` + `ToolRenderContext`), `registerCommand`, `appendEntry`,
 `SettingsList`, and the `AssistantMessageComponent` click-internals patch (`updateContent`,
