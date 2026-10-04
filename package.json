@@ -1,6 +1,6 @@
 {
   "name": "@clapecho233/pi-smart-fold",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "pi coding-agent extension: collapse tool output at startup and fold thinking blocks to a live last line",
   "type": "module",
   "license": "MIT",
