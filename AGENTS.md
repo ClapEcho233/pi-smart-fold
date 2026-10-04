@@ -5,9 +5,13 @@ Agent instructions for working in this repository (a pi coding-agent extension, 
 ## Commands
 
 - `npm run check` — full check: link pi, typecheck, load-check, tests
-- `npm run typecheck` — `tsc -p tsconfig.json` only
+- `npm run typecheck` — link pi, then `tsc -p tsconfig.json`
 - `npm test` / `npm run test:sim` — unit / click-simulation tests
-- `npm run link:pi` — re-link the locally installed pi runtime (also runs as `postinstall`)
+- `npm run link:pi` — link the locally installed pi runtime into `node_modules/` (once after a fresh clone; also run automatically by `typecheck`/`check`)
+
+## No install-phase lifecycle scripts (deliberate — do not re-add)
+
+`package.json` must not declare `preinstall`/`install`/`postinstall`. npm ≥ 11.4 warns about install scripts not covered by `allowScripts`, and npm 12 blocks them by default; v0.2.1 shipped `postinstall: node scripts/link-pi.mjs` and triggered that warning on every install/update. The link is dev-only (typecheck/load-check/tests): at runtime pi's jiti loader aliases `@earendil-works/*` imports to its own modules, so installed extensions never resolve them through `node_modules`.
 
 ## Lockfile discipline (required after touching package metadata)
 
@@ -35,7 +39,7 @@ node -e '
 
 ### Never commit machine-local paths in the lockfile
 
-The pi runtime is linked into `node_modules/` at install time by `scripts/link-pi.mjs` (resolves whatever `pi` is on PATH via `postinstall`). It is **never** a lockfile dependency. If `npm install` (full, not `--package-lock-only`) records the linked package as an `extraneous` local-path entry (e.g. `../../opt/homebrew/Cellar/pi-coding-agent/<ver>/...`), remove that entry before committing, or regenerate with `--package-lock-only`, which ignores `node_modules` state.
+The pi runtime is linked into `node_modules/` on demand by `scripts/link-pi.mjs` (resolves whatever `pi` is on PATH; run via `npm run link:pi`, or automatically by `npm run typecheck`/`npm run check`). It is **never** a lockfile dependency. If `npm install` (full, not `--package-lock-only`) records the linked package as an `extraneous` local-path entry (e.g. `../../opt/homebrew/Cellar/pi-coding-agent/<ver>/...`), remove that entry before committing, or regenerate with `--package-lock-only`, which ignores `node_modules` state.
 
 ## Release checklist
 

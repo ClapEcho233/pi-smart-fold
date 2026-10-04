@@ -99,8 +99,8 @@ pi -e /path/to/pi-smart-fold/index.ts
 ## Development
 
 ```bash
-npm install        # dev deps + relink node_modules/@earendil-works to the installed pi (postinstall)
-npm run link:pi    # re-point the type/runtime links after a pi upgrade — always current version
+npm install        # dev deps only — the package ships no install scripts (npm ≥11 warns / npm 12 blocks them)
+npm run link:pi    # link the installed pi runtime into node_modules (after clone; re-run after a pi upgrade)
 npm run typecheck  # strict tsc against the installed pi's .d.ts (no emit)
 npm run check      # link + typecheck + jiti load-check + unit tests + click simulation
 npm test           # unit tests for the pure functions (native TS type stripping, Node ≥ 22.18, no build step)
@@ -109,8 +109,9 @@ npm run test:sim   # click-cycle simulation against the real pi AssistantMessage
 
 The extension itself has no npm dependencies — pi loads the TypeScript directly via jiti.
 `typescript` / `@types/node` are dev-only, and `node_modules/@earendil-works/*` are symlinks into
-the pi installation that loads the extension (created by `scripts/link-pi.mjs`), so typecheck
-always runs against the exact pi version installed on the machine.
+the pi installation that loads the extension (created by `scripts/link-pi.mjs`, dev-only — at runtime
+pi's jiti loader resolves `@earendil-works/*` imports itself, which is why the package ships no
+install script), so typecheck always runs against the exact pi version installed on the machine.
 
 Project layout:
 

@@ -8,8 +8,15 @@
  *   node_modules/@earendil-works/pi-coding-agent -> <pi>/libexec/lib/node_modules/@earendil-works/pi-coding-agent
  *   node_modules/@earendil-works/pi-tui          -> <pi>/.../pi-coding-agent/node_modules/@earendil-works/pi-tui
  *
- * Re-run after every pi upgrade (also wired up as the npm `postinstall` and
- * `link:pi` scripts; pass --required to fail hard when pi is not found).
+ * Re-run after every pi upgrade (wired up as the `link:pi` script and run
+ * automatically by `typecheck`/`check`; pass --required to fail hard when pi
+ * is not found).
+ *
+ * Deliberately NOT a `postinstall` script: npm >= 11.4 warns about install
+ * scripts not covered by allowScripts and npm 12 blocks them by default.
+ * The link is dev-only (typecheck/load-check/test); at runtime pi's jiti
+ * loader aliases @earendil-works/* imports to its own modules, so installed
+ * extensions never resolve them through node_modules.
  */
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
