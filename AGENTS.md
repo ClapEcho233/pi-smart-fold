@@ -41,9 +41,36 @@ node -e '
 
 The pi runtime is linked into `node_modules/` on demand by `scripts/link-pi.mjs` (resolves whatever `pi` is on PATH; run via `npm run link:pi`, or automatically by `npm run typecheck`/`npm run check`). It is **never** a lockfile dependency. If `npm install` (full, not `--package-lock-only`) records the linked package as an `extraneous` local-path entry (e.g. `../../opt/homebrew/Cellar/pi-coding-agent/<ver>/...`), remove that entry before committing, or regenerate with `--package-lock-only`, which ignores `node_modules` state.
 
+## Git push over blocked SSH port 22 (this machine's network)
+
+The local proxy blocks outbound SSH port 22, and the machine's global git config rewrites every `https://github.com/...` push to `git@github.com:...` (`url.git@github.com:.pushInsteadOf`), so both the configured remote and explicit HTTPS push URLs fail with `Connection closed by ... port 22`. Push over SSH on port 443 instead — the rewrite does not match this URL form:
+
+```bash
+git push ssh://git@ssh.github.com:443/ClapEcho233/pi-smart-fold.git main
+git push ssh://git@ssh.github.com:443/ClapEcho233/pi-smart-fold.git vX.Y.Z
+```
+
+Alternatively `git config --global --unset url.git@github.com:.pushInsteadOf` and push plain HTTPS (the `gh` credential helper is configured), but prefer the non-invasive port-443 URL.
+
+## npm publish requires browser OTP (headless-safe recipe)
+
+`npm publish` on this account requires web-based OTP. In a non-TTY it exits immediately (`EOTP`) with the auth URL masked as `***`, and even under a PTY it sits at `Press ENTER to open in the browser...` without opening anything. Recipe that works (v0.2.3):
+
+```bash
+nohup script -q /tmp/npm-publish.typescript npm publish --access public > /tmp/npm-publish.log 2>&1 &
+sleep 6
+grep -o 'https://www.npmjs.com/auth/cli/[^"]*' /tmp/npm-publish.log   # full URL is in the raw log
+open "$(grep -o 'https://www.npmjs.com/auth/cli/[^"]*' /tmp/npm-publish.log | head -1)"
+```
+
+Then wait for `+ @clapecho233/pi-smart-fold@X.Y.Z` in the log; the registry may take a few minutes to serve the new version (`npm view ... version`), and "Your package is being processed" is normal. Note: the auth URL printed to the PTY is also live in the debug log only in masked form — read the raw stdout log, not `~/.npm/_logs`.
+
 ## Release checklist
 
 1. Bump `version` in `package.json`
 2. `npm install --package-lock-only --ignore-scripts` and confirm only the intended lockfile lines changed (name/version, optionally `hasInstallScript`)
 3. Update README compatibility note if the supported pi version changed
-4. Commit `package.json` + `package-lock.json` together
+4. Commit `package.json` + `package-lock.json` together (README too if touched)
+5. Push `main` and the `vX.Y.Z` tag over SSH port 443 (see "Git push over blocked SSH port 22")
+6. `gh release create vX.Y.Z --title "vX.Y.Z — <summary>"` with install/upgrade notes
+7. `npm publish --access public` via the browser-OTP recipe (see "npm publish requires browser OTP")
