@@ -493,7 +493,7 @@ const MAX_WRITE_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_REVEALED_BLOCKS = 2000;
 
 /** Index of the first line with visible content (padding/blank lines skipped). */
-function firstContentLine(lines: string[]): number {
+function firstContentLine(lines: readonly string[]): number {
   const plain = (line: string): string =>
     line
       .replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "")
@@ -817,7 +817,7 @@ export default function smartFold(pi: ExtensionAPI): void {
 
     render(width: number): string[] {
       const lines = this.inner.render(width);
-      if (lines.length === 0) return lines;
+      if (lines.length === 0) return [];
       const headerIndex = firstContentLine(lines);
 
       const stat = config.writeStat
